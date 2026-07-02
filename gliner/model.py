@@ -900,6 +900,91 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return model_dir
 
     @staticmethod
+    def _token_missing_from_tokenizer(tokenizer, token: str) -> bool:
+        """Check whether a special token is absent from the tokenizer vocabulary.
+
+        A token is considered missing when it cannot be converted to an id, or
+        when it silently maps to the unknown-token id.
+        """
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None:
+            return True
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        return (
+            unk_token_id is not None
+            and token_id == unk_token_id
+            and token != getattr(tokenizer, "unk_token", None)
+        )
+
+    @classmethod
+    def validate_special_token_config(cls, config_instance, tokenizer) -> None:
+        """Validate explicit ``class_token_index``/``vocab_size`` against the tokenizer.
+
+        When these values are hardcoded in the config, GLiNER trusts them and does
+        not add its special tokens (``ent_token``, ``sep_token``). If the tokenizer
+        does not actually contain those tokens, the class-token mask never matches
+        and training proceeds with ``loss=0`` without any error (see issue #332).
+        This check fails fast with actionable guidance instead.
+
+        Args:
+            config_instance: Model configuration with explicit special-token indices.
+            tokenizer: The transformer tokenizer that will be used by the model.
+
+        Raises:
+            ValueError: If ``class_token_index`` is out of range for the tokenizer,
+                or if ``ent_token`` is missing from the tokenizer vocabulary.
+        """
+        tokenizer_size = len(tokenizer)
+
+        if not (0 <= config_instance.class_token_index < tokenizer_size):
+            raise ValueError(
+                f"class_token_index={config_instance.class_token_index} is out of range for the "
+                f"tokenizer (len={tokenizer_size}). The configured index assumes GLiNER special "
+                f"tokens that are not present in this tokenizer. Set class_token_index: -1 and "
+                f"vocab_size: -1 in your config to let GLiNER add the special tokens and detect "
+                f"the indices automatically."
+            )
+
+        ent_token = getattr(config_instance, "ent_token", None)
+        if ent_token is not None and cls._token_missing_from_tokenizer(tokenizer, ent_token):
+            raise ValueError(
+                f"The entity marker token {ent_token!r} is not present in the tokenizer "
+                f"vocabulary, but class_token_index={config_instance.class_token_index} and "
+                f"vocab_size={config_instance.vocab_size} are set explicitly. Training in this "
+                f"state produces an empty entity prompt and a constant zero loss. Set "
+                f"class_token_index: -1 and vocab_size: -1 in your config so GLiNER adds "
+                f"{ent_token!r} and detects its index automatically."
+            )
+
+        for optional_token_attr in ("sep_token", "rel_token"):
+            optional_token = getattr(config_instance, optional_token_attr, None)
+            if optional_token is not None and cls._token_missing_from_tokenizer(tokenizer, optional_token):
+                warnings.warn(
+                    f"The special token {optional_token!r} ({optional_token_attr}) is not present "
+                    f"in the tokenizer vocabulary. Prompts will be built from its subword pieces, "
+                    f"which can degrade quality. Consider setting class_token_index: -1 and "
+                    f"vocab_size: -1 so GLiNER adds all special tokens automatically.",
+                    UserWarning,
+                )
+
+        if ent_token is not None:
+            ent_token_id = tokenizer.convert_tokens_to_ids(ent_token)
+            if ent_token_id is not None and ent_token_id != config_instance.class_token_index:
+                warnings.warn(
+                    f"class_token_index={config_instance.class_token_index} does not match the "
+                    f"tokenizer id of {ent_token!r} ({ent_token_id}). The class-token mask will "
+                    f"match a different token, which can silently disable learning.",
+                    UserWarning,
+                )
+
+        if config_instance.vocab_size != tokenizer_size:
+            warnings.warn(
+                f"config.vocab_size={config_instance.vocab_size} differs from the tokenizer size "
+                f"({tokenizer_size}). Embedding lookups may be misaligned or fail at runtime.",
+                UserWarning,
+            )
+
+    @staticmethod
     def _resize_token_embeddings(instance, config_instance, tokenizer, resize_token_embeddings=True):
         add_tokens = instance._get_special_tokens()
         # Resize token embeddings if needed
@@ -907,6 +992,14 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             if tokenizer is not None:
                 tokenizer.add_tokens(add_tokens, special_tokens=True)
             instance.resize_embeddings()
+        elif (
+            tokenizer is not None
+            and config_instance.class_token_index != -1
+            and config_instance.vocab_size != -1
+        ):
+            # Explicit indices: verify they are consistent with the tokenizer to
+            # avoid silent zero-loss training (issue #332).
+            instance.validate_special_token_config(config_instance, tokenizer)
 
     @classmethod
     def load_from_config(
