@@ -722,10 +722,17 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
 
     @staticmethod
     def _set_tokenizer_spec_tokens(tokenizer):
-        if hasattr(tokenizer, "add_bos_token"):
-            tokenizer.add_bos_token = tokenizer.bos_token_id is not None
-        if hasattr(tokenizer, "add_eos_token"):
-            tokenizer.add_eos_token = tokenizer.eos_token_id is not None
+        # Opt in to bos/eos only when the tokenizer actually defines them
+        # (spm-based models where transformers v5 stopped adding them, #324).
+        # Never assign False: on transformers>=5 every tokenizer exposes
+        # add_bos_token/add_eos_token, and assigning them rebuilds the backend
+        # post-processor — for cls/sep-style tokenizers (ModernBERT etc.),
+        # whose bos/eos ids are None, that strips [CLS]/[SEP] and silently
+        # degrades predictions to near-zero scores.
+        if hasattr(tokenizer, "add_bos_token") and tokenizer.bos_token_id is not None:
+            tokenizer.add_bos_token = True
+        if hasattr(tokenizer, "add_eos_token") and tokenizer.eos_token_id is not None:
+            tokenizer.add_eos_token = True
         return tokenizer
 
     @classmethod
