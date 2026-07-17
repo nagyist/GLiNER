@@ -1,14 +1,4 @@
 <div align="center">
-  <a href="https://pioneer.ai/gliner" target="_blank" rel="noopener noreferrer">
-    <img src="image/GitHub.png" alt="Pioneer AI - Fine-tune GLiNER with a single prompt" width="100%"/>
-  </a>
-</div>
-
-> [!IMPORTANT]
-> **🚀 GLiNER2 is Now Available from [Fastino Labs](https://github.com/fastino-ai)!** A unified multi-task model for NER, Text Classification & Structured Data Extraction. Check out [fastino-ai/GLiNER2 →](https://github.com/fastino-ai/GLiNER2)
-
-
-<div align="center">
 
 # GLiNER: Generalist and Lightweight Model for Named Entity Recognition
 
