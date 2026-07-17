@@ -636,6 +636,68 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             new_state_dict[_key] = tensor
         return new_state_dict
 
+    @staticmethod
+    def _prepare_safetensors_state_dict(state_dict):
+        """Make a state dict safe to serialize without duplicating tied weights.
+
+        ``safetensors.torch.save_model`` handles exact parameter aliases, but it
+        rejects tensors that cover only part of their backing storage. CUDA RNN
+        flattening can leave LSTM parameters in exactly that form after the
+        first forward pass. This helper preserves exact aliases as metadata and
+        clones only tensors whose storage layout cannot be saved directly.
+
+        Returns:
+            A tuple of ``(tensors, metadata)`` suitable for ``save_file``.
+        """
+        tensors = {}
+        metadata = {}
+        aliases = {}
+        retained_storages = set()
+
+        for name, tensor in state_dict.items():
+            if not torch.is_tensor(tensor):
+                raise TypeError(f"State dict entry {name!r} is not a tensor: {type(tensor).__name__}")
+
+            storage_key = None
+            alias_key = None
+            if tensor.device.type != "meta" and tensor.layout == torch.strided and tensor.numel() > 0:
+                storage = tensor.untyped_storage()
+                storage_key = (tensor.device, storage.data_ptr(), storage.nbytes())
+                alias_key = (
+                    *storage_key,
+                    tensor.data_ptr(),
+                    tensor.storage_offset(),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                )
+
+            kept_name = aliases.get(alias_key) if alias_key is not None else None
+            if kept_name is not None:
+                metadata[name] = kept_name
+                continue
+            if alias_key is not None:
+                aliases[alias_key] = name
+
+            must_clone = not tensor.is_contiguous()
+            if storage_key is not None:
+                storage = tensor.untyped_storage()
+                covers_storage = (
+                    tensor.data_ptr() == storage.data_ptr()
+                    and tensor.numel() * tensor.element_size() == storage.nbytes()
+                )
+                must_clone = must_clone or not covers_storage or storage_key in retained_storages
+                if not must_clone:
+                    retained_storages.add(storage_key)
+
+            tensor_to_save = tensor
+            if must_clone:
+                tensor_to_save = tensor.detach().clone(memory_format=torch.contiguous_format)
+
+            tensors[name] = tensor_to_save
+
+        return tensors, metadata
+
     def save_pretrained(
         self,
         save_directory: Union[str, Path],
@@ -662,12 +724,19 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
 
-        # Save model weights
-        model_state_dict = self.prepare_state_dict(self.model.state_dict())
-
         if safe_serialization:
-            save_file(model_state_dict, save_directory / "model.safetensors")
+            # Saving the original module avoids leaking torch.compile's
+            # ``_orig_mod.`` prefix into checkpoint keys.
+            model_to_save = getattr(self.model, "_orig_mod", self.model)
+            model_state_dict = self.prepare_state_dict(model_to_save.state_dict())
+            model_state_dict, metadata = self._prepare_safetensors_state_dict(model_state_dict)
+            save_file(
+                model_state_dict,
+                save_directory / "model.safetensors",
+                metadata=metadata or None,
+            )
         else:
+            model_state_dict = self.prepare_state_dict(self.model.state_dict())
             torch.save(model_state_dict, save_directory / "pytorch_model.bin")
 
         # Save config
@@ -840,11 +909,22 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         if model_file.suffix == ".safetensors" or str(model_file).endswith(".safetensors"):
             state_dict = {}
             with safe_open(model_file, framework="pt", device=map_location) as f:
+                metadata = f.metadata() or {}
                 for key in f.keys():  # noqa: SIM118
                     tensor = f.get_tensor(key)
                     if dtype is not None and tensor.is_floating_point() and tensor.dtype != dtype:
                         tensor = tensor.to(dtype)
                     state_dict[key] = tensor
+
+            # ``safetensors.torch.save_model`` stores every omitted shared
+            # tensor as metadata[omitted_name] = saved_name. Recreate those
+            # aliases so the existing PyTorch load paths, including strict and
+            # meta-device loading, continue to receive a complete state dict.
+            # Other metadata (for example {"format": "pt"}) is ignored because
+            # its value is not a tensor name in the checkpoint.
+            for omitted_name, saved_name in metadata.items():
+                if omitted_name not in state_dict and saved_name in state_dict:
+                    state_dict[omitted_name] = state_dict[saved_name]
         else:
             state_dict = torch.load(model_file, map_location=torch.device(map_location), weights_only=True)
             if dtype is not None:
