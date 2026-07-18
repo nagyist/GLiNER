@@ -3,7 +3,9 @@ from typing import List, Tuple, Union, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import DebertaV2Config
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from transformers.models.deberta_v2.modeling_deberta_v2 import DebertaV2Encoder
 
 
 class LstmSeq2SeqEncoder(nn.Module):
@@ -482,3 +484,104 @@ class LayersFuser(nn.Module):
         output = self.output_projection(U_sum)  # [B, L, output_size]
 
         return output
+
+class DecoderLabelsEncoder(nn.Module):
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        self.config = config
+
+        num_layers = getattr(config, "scorer_encoder_num_layers", 2)
+        num_heads = max(1, config.hidden_size // 64)
+
+        encoder_config = DebertaV2Config(
+            hidden_size=config.hidden_size,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
+            intermediate_size=config.hidden_size * 4,
+            relative_attention=True,
+            pos_att_type=["p2c", "c2p"],
+            max_relative_positions=512,
+        )
+        self.scorer_encoder = DebertaV2Encoder(encoder_config)
+
+        self.text_projector = nn.Linear(config.hidden_size, config.hidden_size)
+        self.label_projector = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+
+        self.mlp = create_projection_layer(config.hidden_size * 2, config.dropout, out_dim=config.hidden_size)
+
+    def _extract_representations(self, hidden_states, input_ids, attention_mask):
+        """
+        Extract text and label representations from hidden states.
+
+        Sequence: <<SEP>>label1<<LABEL>>label2<<LABEL>><<SEP>>Text
+        Text repr: final token with a positive attention mask value
+        Label repr: each <<LABEL>> token
+        """
+        batch_size, seq_length, hidden_size = hidden_states.shape
+
+        label_token_id = self.config.class_token_index
+
+        valid_mask = attention_mask.gt(0)
+        label_token_mask = input_ids.eq(label_token_id) & valid_mask
+
+        positions = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)
+        last_text_positions = positions.masked_fill(~valid_mask, -1).amax(dim=1)
+        has_text = last_text_positions.ge(0)
+        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        text_repr = hidden_states[batch_indices, last_text_positions.clamp_min(0)]
+        text_repr = text_repr * has_text.unsqueeze(-1)
+
+        num_labels_per_batch = label_token_mask.sum(dim=1)
+        max_labels = num_labels_per_batch.max().item()
+        label_repr = hidden_states.new_zeros(
+            batch_size,
+            max_labels,
+            hidden_size,
+        )
+        labels_mask = (
+            torch.arange(max_labels, device=input_ids.device).unsqueeze(0)
+            < num_labels_per_batch.unsqueeze(1)
+        ).to(attention_mask.dtype)
+
+        label_batch_indices, label_token_indices = label_token_mask.nonzero(as_tuple=True)
+        label_ranks = label_token_mask.long().cumsum(dim=1) - 1
+        label_indices = label_ranks[label_batch_indices, label_token_indices]
+        label_repr[label_batch_indices, label_indices] = hidden_states[label_batch_indices, label_token_indices]
+
+        return text_repr, label_repr, labels_mask
+
+    def forward(self, hidden_states, input_ids, attention_mask, **kwargs):
+        """Forward pass.
+
+        Args:
+            hidden_states: (batch_size, seq_length, hidden_size) from decoder backbone
+            input_ids: (batch_size, seq_length)
+            attention_mask: (batch_size, seq_length)
+            **kwargs: Reserved for interface compatibility.
+
+        Returns:
+            Tuple containing:
+                - label representations of shape (batch_size, num_labels, hidden_size)
+                - label mask of shape (batch_size, num_labels)
+        """
+        encoder_outputs = self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True)
+
+        contextualized_hidden_states = encoder_outputs.last_hidden_state
+
+        text_repr, label_repr, labels_mask = self._extract_representations(
+            contextualized_hidden_states, input_ids, attention_mask
+        )
+
+        text_repr = self.text_projector(text_repr)
+        text_repr = self.dropout(text_repr)
+
+        label_repr = self.label_projector(label_repr)
+
+        batch_size, num_labels, dim = label_repr.shape
+        text_repr_expanded = text_repr.unsqueeze(1).expand(batch_size, num_labels, dim)
+        combined_rep = torch.cat([text_repr_expanded, label_repr], dim=-1)
+
+        final_label_repr = self.mlp(combined_rep).squeeze(-1)
+
+        return final_label_repr, labels_mask
