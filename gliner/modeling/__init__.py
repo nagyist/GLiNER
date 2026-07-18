@@ -1,5 +1,6 @@
 from .base import (
     BaseModel,
+    DecoderSpanModel,
     BaseBiEncoderModel,
     BiEncoderSpanModel,
     BaseUniEncoderModel,

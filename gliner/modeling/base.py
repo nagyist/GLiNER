@@ -612,6 +612,14 @@ class DecoderSpanModel(UniEncoderSpanModel):
         if self.token_rep_layer.decoder_hidden_size != config.hidden_size:
             self.token_projection = nn.Linear(self.token_rep_layer.decoder_hidden_size, config.hidden_size)
         self.labels_encoder = DecoderLabelsEncoder(config)
+        self.span_rep_layer = SpanRepLayer(
+            span_mode=config.span_mode,
+            hidden_size=config.hidden_size,
+            max_width=config.max_width,
+            dropout=config.dropout,
+            context_encoder=getattr(config, "span_context_encoder", "none"),
+            context_num_layers=getattr(config, "span_context_num_layers", 1),
+        )
 
     def _init_token_rep_layer(
         self,
@@ -840,38 +848,58 @@ class DecoderSpanModel(UniEncoderSpanModel):
         words_embedding = representations.words_embedding
         mask = representations.mask
 
-        target_W = span_idx.size(1) // self.config.max_width
-        words_embedding, mask = self._fit_length(words_embedding, mask, target_W)
+        if span_idx is None or span_mask is None:
+            raise ValueError("span_idx and span_mask are required")
 
-        span_idx = span_idx * span_mask.unsqueeze(-1)
+        batch_size = words_embedding.size(0)
+        flat_span_idx = span_idx.view(batch_size, -1, 2)
+        flat_span_mask = span_mask.view(batch_size, -1).bool()
+        safe_span_idx = flat_span_idx * flat_span_mask.unsqueeze(-1).long()
 
-        span_rep = self.span_rep_layer(words_embedding, span_idx)
+        span_rep, contextualized_words = self.span_rep_layer(
+            words_embedding,
+            safe_span_idx,
+            word_mask=mask,
+            return_words=True,
+        )
 
-        target_C = prompts_embedding.size(1)
+        cached_prompts_embedding = prompts_embedding
+        cached_prompts_mask = prompts_embedding_mask
+        target_C = cached_prompts_embedding.size(1)
         if labels is not None:
             target_C = max(target_C, labels.size(-1))
 
-        prompts_embedding, prompts_embedding_mask = self._fit_length(
-            prompts_embedding, prompts_embedding_mask, target_C
+        cached_prompts_embedding, prompts_embedding_mask = self._fit_length(
+            cached_prompts_embedding, cached_prompts_mask, target_C
         )
 
-        prompts_embedding = self.prompt_rep_layer(prompts_embedding)
+        prompts_embedding = self.prompt_rep_layer(cached_prompts_embedding)
         scores = torch.einsum("BLKD,BCD->BLKC", span_rep, prompts_embedding)
 
         loss = None
         if labels is not None:
-            loss = self.loss(scores, labels, prompts_embedding_mask, span_mask, **kwargs)
+            loss = self.loss(
+                scores,
+                labels,
+                prompts_embedding_mask,
+                flat_span_mask,
+                **kwargs,
+            )
 
         output = GLiNERDecoderSpanOutput(
             logits=scores,
             loss=loss,
             prompts_embedding=prompts_embedding,
             prompts_embedding_mask=prompts_embedding_mask,
-            words_embedding=words_embedding,
+            words_embedding=contextualized_words,
             mask=mask,
+            span_idx=flat_span_idx,
+            span_mask=flat_span_mask,
             past_key_values=representations.past_key_values,
             past_word_embeddings=representations.past_word_embeddings,
             past_word_mask=representations.past_word_mask,
+            cached_prompts_embedding=cached_prompts_embedding,
+            cached_prompts_mask=prompts_embedding_mask,
         )
         return output
 

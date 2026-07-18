@@ -253,3 +253,40 @@ def prepare_span_idx(num_tokens, max_width):
     starts = torch.arange(num_tokens, dtype=torch.long).unsqueeze(1).expand(-1, max_width).reshape(-1)
     offsets = torch.arange(max_width, dtype=torch.long).unsqueeze(0).expand(num_tokens, -1).reshape(-1)
     return torch.stack([starts, starts + offsets], dim=1)
+
+
+def prepare_streaming_span_idx(
+    past_tokens: int,
+    new_tokens: int,
+    max_width: int,
+    recompute_all: bool = False,
+):
+    """Generate absolute span candidates for the next streaming chunk.
+
+    In incremental mode only spans that reach the new chunk are valid, but
+    starts from up to ``max_width - 1`` cached words are retained so entities
+    crossing a chunk boundary are not lost.  Full-recompute mode enumerates
+    every historical span again.
+
+    Returns:
+        A tuple ``(span_idx, span_mask)`` where ``span_idx`` has shape
+        ``(num_starts * max_width, 2)`` and uses absolute session word indices.
+    """
+    if past_tokens < 0 or new_tokens < 0:
+        raise ValueError("past_tokens and new_tokens must be non-negative")
+    if max_width < 1:
+        raise ValueError("max_width must be positive")
+
+    total_tokens = past_tokens + new_tokens
+    if total_tokens == 0:
+        return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.bool)
+
+    first_start = 0 if recompute_all else max(0, past_tokens - (max_width - 1))
+    num_starts = total_tokens - first_start
+    span_idx = prepare_span_idx(num_starts, max_width) + first_start
+
+    span_mask = span_idx[:, 1] < total_tokens
+    if not recompute_all:
+        span_mask = span_mask & span_idx[:, 1].ge(past_tokens)
+
+    return span_idx, span_mask

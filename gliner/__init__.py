@@ -1,7 +1,7 @@
 __version__ = "0.2.27"
 
 from .model import GLiNER
-from .config import GLiNERConfig
+from .config import GLiNERConfig, DecoderSpanConfig
 from .infer_packing import (
     PackedBatch,
     InferencePackingConfig,
@@ -14,6 +14,7 @@ from .infer_packing import (
 #                                     GLiNERDocREDEvaluator)
 
 __all__ = [
+    "DecoderSpanConfig",
     "GLiNER",
     "GLiNERConfig",
     "InferencePackingConfig",

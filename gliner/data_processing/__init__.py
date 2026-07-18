@@ -1,4 +1,5 @@
 from .collator import (
+    DecoderSpanDataCollator,
     BiEncoderSpanDataCollator,
     BiEncoderTokenDataCollator,
     UniEncoderSpanDataCollator,
@@ -10,6 +11,7 @@ from .collator import (
 )
 from .processor import (
     BaseProcessor,
+    DecoderSpanProcessor,
     BaseBiEncoderProcessor,
     BiEncoderSpanProcessor,
     BiEncoderTokenProcessor,

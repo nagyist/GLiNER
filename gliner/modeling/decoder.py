@@ -86,8 +86,9 @@ class DecoderTransformer(nn.Module):
 
         Args:
             model_name: Name or path of the pretrained model to load.
-            config: Configuration object containing model hyperparameters. Must have
-                a `labels_decoder_config` attribute.
+            config: Configuration object containing model hyperparameters. DecoderSpan
+                models use ``decoder_config``; auxiliary generative decoders retain
+                the legacy ``labels_decoder_config`` field.
             from_pretrained: If True, loads pretrained weights. If False, initializes
                 from config only. Defaults to False.
             cache_dir: Optional directory for caching downloaded models. Defaults to None.
@@ -98,7 +99,9 @@ class DecoderTransformer(nn.Module):
             Warning: If adapter config is found but PEFT package is not installed.
         """
         super().__init__()
-        decoder_config = config.labels_decoder_config
+        decoder_config = getattr(config, "decoder_config", None)
+        if decoder_config is None:
+            decoder_config = getattr(config, "labels_decoder_config", None)
         if decoder_config is None:
             decoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
 
@@ -165,8 +168,9 @@ class Decoder(nn.Module):
         """Initializes the decoder.
 
         Args:
-            config: Configuration object containing model hyperparameters including
-                `labels_decoder` (model name) and decoder-specific settings.
+            config: Configuration object containing model hyperparameters. DecoderSpan
+                uses ``model_name`` for its backbone; legacy generative architectures
+                use ``labels_decoder`` for their separate decoder.
             from_pretrained: If True, loads pretrained weights for the decoder.
                 Defaults to False.
             cache_dir: Optional directory for caching downloaded models. Defaults to None.
@@ -175,8 +179,9 @@ class Decoder(nn.Module):
         """
         super().__init__()
 
+        model_name = getattr(config, "labels_decoder", None) or config.model_name
         self.decoder_layer = DecoderTransformer(
-            config.labels_decoder,
+            model_name,
             config,
             from_pretrained,
             cache_dir=cache_dir,

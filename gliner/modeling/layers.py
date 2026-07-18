@@ -490,32 +490,85 @@ class DecoderLabelsEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        num_layers = getattr(config, "scorer_encoder_num_layers", 2)
-        num_heads = max(1, config.hidden_size // 64)
+        encoder_config = getattr(config, "labels_encoder_config", None)
+        if encoder_config is None:
+            # Compatibility for config-like objects created before DecoderSpan
+            # gained its dedicated nested label-encoder configuration.
+            num_layers = getattr(config, "scorer_encoder_num_layers", 2)
+            num_heads = max(1, config.hidden_size // 64)
+            while config.hidden_size % num_heads:
+                num_heads -= 1
+            encoder_config = DebertaV2Config(
+                hidden_size=config.hidden_size,
+                num_hidden_layers=num_layers,
+                num_attention_heads=num_heads,
+                intermediate_size=config.hidden_size * 4,
+                relative_attention=True,
+                pos_att_type=["p2c", "c2p"],
+                max_relative_positions=512,
+            )
 
-        encoder_config = DebertaV2Config(
-            hidden_size=config.hidden_size,
-            num_hidden_layers=num_layers,
-            num_attention_heads=num_heads,
-            intermediate_size=config.hidden_size * 4,
-            relative_attention=True,
-            pos_att_type=["p2c", "c2p"],
-            max_relative_positions=512,
-        )
+        encoder_hidden_size = encoder_config.hidden_size
+        if encoder_hidden_size == config.hidden_size:
+            self.input_projector = nn.Identity()
+        else:
+            self.input_projector = nn.Linear(config.hidden_size, encoder_hidden_size)
+        self.encoder_config = encoder_config
         self.scorer_encoder = DebertaV2Encoder(encoder_config)
 
-        self.text_projector = nn.Linear(config.hidden_size, config.hidden_size)
-        self.label_projector = nn.Linear(config.hidden_size, config.hidden_size)
+        self.text_projector = nn.Linear(encoder_hidden_size, config.hidden_size)
+        self.label_projector = nn.Linear(encoder_hidden_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
 
         self.mlp = create_projection_layer(config.hidden_size * 2, config.dropout, out_dim=config.hidden_size)
+
+    def _slice_prompt(self, hidden_states, input_ids, attention_mask):
+        """Compact each prompt from its first valid token through its first separator."""
+        sep_token_id = getattr(self.config, "sep_token_index", -1)
+        if sep_token_id < 0:
+            raise ValueError("DecoderLabelsEncoder requires config.sep_token_index to be set")
+
+        valid_mask = attention_mask.gt(0)
+        sep_mask = input_ids.eq(sep_token_id) & valid_mask
+        has_separator = sep_mask.any(dim=1)
+        if not has_separator.all():
+            missing = (~has_separator).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(f"No separator token was found for batch rows {missing}")
+
+        batch_size, seq_length, hidden_size = hidden_states.shape
+        positions = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)
+        first_valid = positions.masked_fill(~valid_mask, seq_length).amin(dim=1)
+        first_separator = positions.masked_fill(~sep_mask, seq_length).amin(dim=1)
+        prompt_lengths = first_separator - first_valid + 1
+        if (prompt_lengths <= 0).any():
+            invalid = prompt_lengths.le(0).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(f"Separator token precedes the prompt for batch rows {invalid}")
+
+        max_prompt_length = int(prompt_lengths.max().item())
+        prompt_offsets = torch.arange(max_prompt_length, device=input_ids.device).unsqueeze(0)
+        source_positions = first_valid.unsqueeze(1) + prompt_offsets
+        within_prompt = prompt_offsets < prompt_lengths.unsqueeze(1)
+        safe_positions = source_positions.clamp_max(seq_length - 1)
+
+        prompt_hidden_states = torch.gather(
+            hidden_states,
+            1,
+            safe_positions.unsqueeze(-1).expand(-1, -1, hidden_size),
+        )
+        prompt_input_ids = torch.gather(input_ids, 1, safe_positions)
+        gathered_attention_mask = torch.gather(attention_mask, 1, safe_positions)
+        prompt_attention_mask = gathered_attention_mask.masked_fill(~within_prompt, 0)
+        valid_prompt_mask = within_prompt & prompt_attention_mask.gt(0)
+        prompt_hidden_states = prompt_hidden_states * valid_prompt_mask.unsqueeze(-1)
+        prompt_input_ids = prompt_input_ids.masked_fill(~valid_prompt_mask, 0)
+        return prompt_hidden_states, prompt_input_ids, prompt_attention_mask
 
     def _extract_representations(self, hidden_states, input_ids, attention_mask):
         """
         Extract text and label representations from hidden states.
 
-        Sequence: <<SEP>>label1<<LABEL>>label2<<LABEL>><<SEP>>Text
-        Text repr: final token with a positive attention mask value
+        Sequence: label1<<LABEL>>label2<<LABEL>><<SEP>>Text
+        Prompt repr: the separator token (the final valid token in the slice)
         Label repr: each <<LABEL>> token
         """
         batch_size, seq_length, hidden_size = hidden_states.shape
@@ -565,12 +618,24 @@ class DecoderLabelsEncoder(nn.Module):
                 - label representations of shape (batch_size, num_labels, hidden_size)
                 - label mask of shape (batch_size, num_labels)
         """
-        encoder_outputs = self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True)
+        prompt_hidden_states, prompt_input_ids, prompt_attention_mask = self._slice_prompt(
+            hidden_states,
+            input_ids,
+            attention_mask,
+        )
+        prompt_hidden_states = self.input_projector(prompt_hidden_states)
+        encoder_outputs = self.scorer_encoder(
+            prompt_hidden_states,
+            attention_mask=prompt_attention_mask,
+            return_dict=True,
+        )
 
         contextualized_hidden_states = encoder_outputs.last_hidden_state
 
         text_repr, label_repr, labels_mask = self._extract_representations(
-            contextualized_hidden_states, input_ids, attention_mask
+            contextualized_hidden_states,
+            prompt_input_ids,
+            prompt_attention_mask,
         )
 
         text_repr = self.text_projector(text_repr)

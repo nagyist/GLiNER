@@ -60,6 +60,8 @@ class GLiNERDecoderSpanOutput(GLiNERBaseOutput):
     past_key_values: Optional[Any] = None
     past_word_embeddings: Optional[torch.FloatTensor] = None
     past_word_mask: Optional[torch.LongTensor] = None
+    cached_prompts_embedding: Optional[torch.FloatTensor] = None
+    cached_prompts_mask: Optional[torch.LongTensor] = None
 
 
 @dataclass

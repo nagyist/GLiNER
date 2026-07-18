@@ -562,6 +562,116 @@ class SpanDecoder(BaseSpanDecoder):
         ent_type = id_to_class[class_idx + 1]  # +1 because 0 is <pad>
         return Span(start=start, end=start + width, entity_type=ent_type, score=score, class_probs=class_probs)
 
+    def _decode_explicit_spans(
+        self,
+        id_to_classes,
+        model_output,
+        span_idx,
+        span_mask,
+        flat_ner=False,
+        threshold=0.5,
+        multi_label=False,
+        return_class_probs=False,
+        input_spans=None,
+    ):
+        """Decode logits paired with explicit absolute span boundaries."""
+        probabilities = torch.sigmoid(model_output)
+        if probabilities.dim() == 4:
+            probabilities = probabilities.flatten(1, 2)
+        span_idx = span_idx.view(span_idx.size(0), -1, 2)
+        span_mask = span_mask.view(span_mask.size(0), -1).bool()
+
+        batch_size, _, num_classes = probabilities.shape
+        thresholds = _expand_batch_param(threshold, batch_size, "threshold")
+        flat_values = _expand_batch_param(flat_ner, batch_size, "flat_ner")
+        multi_values = _expand_batch_param(multi_label, batch_size, "multi_label")
+
+        probabilities_cpu = probabilities.tolist()
+        span_idx_cpu = span_idx.tolist()
+        span_mask_cpu = span_mask.tolist()
+        decoded = []
+        for batch_idx in range(batch_size):
+            id_to_class = self._get_id_to_class_for_sample(id_to_classes, batch_idx)
+            allowed = set(input_spans[batch_idx]) if input_spans is not None else None
+            candidates = []
+            for span_pos, valid in enumerate(span_mask_cpu[batch_idx]):
+                if not valid:
+                    continue
+                start, end = span_idx_cpu[batch_idx][span_pos]
+                if allowed is not None and (start, end) not in allowed:
+                    continue
+                class_scores = probabilities_cpu[batch_idx][span_pos]
+                for class_idx in range(num_classes):
+                    score = class_scores[class_idx]
+                    if score <= thresholds[batch_idx] or class_idx + 1 not in id_to_class:
+                        continue
+                    class_probs = None
+                    if return_class_probs:
+                        top_indices = sorted(
+                            range(num_classes),
+                            key=class_scores.__getitem__,
+                            reverse=True,
+                        )[:5]
+                        class_probs = {
+                            id_to_class.get(index + 1, f"class_{index}"): class_scores[index]
+                            for index in top_indices
+                        }
+                    candidates.append(
+                        Span(
+                            start=start,
+                            end=end,
+                            entity_type=id_to_class[class_idx + 1],
+                            score=score,
+                            class_probs=class_probs,
+                        )
+                    )
+            decoded.append(
+                self.greedy_search(
+                    candidates,
+                    flat_values[batch_idx],
+                    multi_label=multi_values[batch_idx],
+                )
+            )
+        return decoded
+
+    def decode(
+        self,
+        tokens,
+        id_to_classes,
+        model_output,
+        flat_ner=False,
+        threshold=0.5,
+        multi_label=False,
+        return_class_probs=False,
+        input_spans=None,
+        **kwargs,
+    ):
+        span_idx = kwargs.get("span_idx")
+        span_mask = kwargs.get("span_mask")
+        if span_idx is not None and span_mask is not None:
+            return self._decode_explicit_spans(
+                id_to_classes=id_to_classes,
+                model_output=model_output,
+                span_idx=span_idx,
+                span_mask=span_mask,
+                flat_ner=flat_ner,
+                threshold=threshold,
+                multi_label=multi_label,
+                return_class_probs=return_class_probs,
+                input_spans=input_spans,
+            )
+        return super().decode(
+            tokens=tokens,
+            id_to_classes=id_to_classes,
+            model_output=model_output,
+            flat_ner=flat_ner,
+            threshold=threshold,
+            multi_label=multi_label,
+            return_class_probs=return_class_probs,
+            input_spans=input_spans,
+            **kwargs,
+        )
+
 
 class SpanGenerativeDecoder(BaseSpanDecoder):
     """
