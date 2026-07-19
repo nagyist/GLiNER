@@ -1,8 +1,8 @@
 from .base import (
     BaseModel,
-    DecoderSpanModel,
     BaseBiEncoderModel,
     BiEncoderSpanModel,
+    StreamingSpanModel,
     BaseUniEncoderModel,
     BiEncoderTokenModel,
     UniEncoderSpanModel,

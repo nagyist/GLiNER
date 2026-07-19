@@ -86,7 +86,7 @@ class DecoderTransformer(nn.Module):
 
         Args:
             model_name: Name or path of the pretrained model to load.
-            config: Configuration object containing model hyperparameters. DecoderSpan
+            config: Configuration object containing model hyperparameters. StreamingSpan
                 models use ``decoder_config``; auxiliary generative decoders retain
                 the legacy ``labels_decoder_config`` field.
             from_pretrained: If True, loads pretrained weights. If False, initializes
@@ -105,12 +105,25 @@ class DecoderTransformer(nn.Module):
         if decoder_config is None:
             decoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
 
+        is_streaming_span = getattr(config, "model_type", None) == "gliner_streaming_span"
+        saved_vocab_size = getattr(config, "vocab_size", -1)
+        if is_streaming_span and not from_pretrained and saved_vocab_size > 0:
+            # StreamingSpan adds <<LABEL>> and <<SEP>> to the backbone tokenizer.
+            # The top-level size is saved with the trained embedding matrix and
+            # must win over a stale/base decoder config during reconstruction.
+            decoder_config.vocab_size = saved_vocab_size
+
         model_class = AutoModelForCausalLM if use_causal_lm else AutoModel
 
         if from_pretrained:
             self.model = model_class.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
         else:
             self.model = model_class.from_config(decoder_config, trust_remote_code=True)
+
+        if is_streaming_span:
+            # Keep the resolved Hugging Face config attached to GLiNER so later
+            # token resizing is serialized into gliner_config.json.
+            config.decoder_config = self.model.config
 
         adapter_config_file = Path(model_name) / "adapter_config.json"
 
@@ -168,7 +181,7 @@ class Decoder(nn.Module):
         """Initializes the decoder.
 
         Args:
-            config: Configuration object containing model hyperparameters. DecoderSpan
+            config: Configuration object containing model hyperparameters. StreamingSpan
                 uses ``model_name`` for its backbone; legacy generative architectures
                 use ``labels_decoder`` for their separate decoder.
             from_pretrained: If True, loads pretrained weights for the decoder.

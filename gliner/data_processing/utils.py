@@ -260,12 +260,14 @@ def prepare_streaming_span_idx(
     new_tokens: int,
     max_width: int,
     recompute_all: bool = False,
+    right_context_width: int = 0,
 ):
     """Generate absolute span candidates for the next streaming chunk.
 
-    In incremental mode only spans that reach the new chunk are valid, but
-    starts from up to ``max_width - 1`` cached words are retained so entities
-    crossing a chunk boundary are not lost.  Full-recompute mode enumerates
+    In incremental mode, all spans ending in the new chunk are valid.  Spans
+    ending up to ``right_context_width`` words before the latest word are also
+    regenerated so future context can revise their scores.  A zero-width right
+    context preserves append-only scoring.  Full-recompute mode enumerates
     every historical span again.
 
     Returns:
@@ -276,17 +278,30 @@ def prepare_streaming_span_idx(
         raise ValueError("past_tokens and new_tokens must be non-negative")
     if max_width < 1:
         raise ValueError("max_width must be positive")
+    if right_context_width < 0:
+        raise ValueError("right_context_width must be non-negative")
 
     total_tokens = past_tokens + new_tokens
     if total_tokens == 0:
         return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.bool)
 
-    first_start = 0 if recompute_all else max(0, past_tokens - (max_width - 1))
+    if recompute_all:
+        minimum_end = 0
+    else:
+        latest_word = total_tokens - 1
+        rolling_minimum_end = max(0, latest_word - right_context_width)
+        # Always score every span ending in the newly supplied chunk, even when
+        # a caller appends more words than the configured right-context window.
+        minimum_end = min(past_tokens, rolling_minimum_end)
+
+    first_start = max(0, minimum_end - (max_width - 1))
     num_starts = total_tokens - first_start
     span_idx = prepare_span_idx(num_starts, max_width) + first_start
 
     span_mask = span_idx[:, 1] < total_tokens
     if not recompute_all:
-        span_mask = span_mask & span_idx[:, 1].ge(past_tokens)
+        span_mask = span_mask & span_idx[:, 1].ge(minimum_end)
+        if new_tokens == 0:
+            span_mask.zero_()
 
     return span_idx, span_mask

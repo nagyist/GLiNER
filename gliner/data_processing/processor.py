@@ -621,7 +621,7 @@ class UniEncoderSpanProcessor(BaseProcessor):
         return tokenized_input
 
 
-class DecoderSpanProcessor(UniEncoderSpanProcessor):
+class StreamingSpanProcessor(UniEncoderSpanProcessor):
     """Span processor for a causal-decoder text backbone.
 
     Labels are terminated by a marker rather than introduced by one.  This is

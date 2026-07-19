@@ -34,8 +34,8 @@ from .utils import is_module_available
 from .config import (
     GLiNERConfig,
     BaseGLiNERConfig,
-    DecoderSpanConfig,
     BiEncoderSpanConfig,
+    StreamingSpanConfig,
     BiEncoderTokenConfig,
     UniEncoderSpanConfig,
     UniEncoderTokenConfig,
@@ -67,8 +67,8 @@ from .decoding.trie import LabelsTrie
 from .infer_packing import InferencePackingConfig
 from .modeling.base import (
     BaseModel,
-    DecoderSpanModel,
     BiEncoderSpanModel,
+    StreamingSpanModel,
     BiEncoderTokenModel,
     UniEncoderSpanModel,
     UniEncoderTokenModel,
@@ -81,8 +81,8 @@ from .modeling.cache import CacheState, SessionCacheManager, copy_past_key_value
 from .modeling.utils import extract_prompt_features
 from .data_processing import (
     BaseProcessor,
-    DecoderSpanProcessor,
     BiEncoderSpanProcessor,
+    StreamingSpanProcessor,
     BiEncoderTokenProcessor,
     UniEncoderSpanProcessor,
     UniEncoderTokenProcessor,
@@ -93,8 +93,8 @@ from .data_processing import (
 )
 from .data_processing.utils import prepare_streaming_span_idx
 from .data_processing.collator import (
-    DecoderSpanDataCollator,
     BiEncoderSpanDataCollator,
+    StreamingSpanDataCollator,
     BiEncoderTokenDataCollator,
     UniEncoderSpanDataCollator,
     UniEncoderTokenDataCollator,
@@ -3102,14 +3102,14 @@ class UniEncoderSpanGLiNER(BaseEncoderGLiNER):
         return UniEncoderSpanWrapper(core_model)
 
 
-class DecoderSpanGLiNER(BaseEncoderGLiNER):
+class StreamingSpanGLiNER(BaseEncoderGLiNER):
     """Causal-decoder span model with optional per-session streaming state."""
 
-    config_class = DecoderSpanConfig
-    model_class = DecoderSpanModel
+    config_class = StreamingSpanConfig
+    model_class = StreamingSpanModel
     ort_model_class = None
-    data_processor_class = DecoderSpanProcessor
-    data_collator_class = DecoderSpanDataCollator
+    data_processor_class = StreamingSpanProcessor
+    data_collator_class = StreamingSpanDataCollator
     decoder_class = SpanDecoder
 
     def __init__(self, *args, **kwargs):
@@ -3137,6 +3137,22 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
         self.data_processor = self.data_processor_class(config, tokenizer, words_splitter)
         return self.data_processor
 
+    @staticmethod
+    def _resize_token_embeddings(instance, _config_instance, tokenizer, resize_token_embeddings=True):
+        """Match the real decoder embedding rows before checkpoint weights load.
+
+        StreamingSpan checkpoints can have valid saved special-token indices while
+        an older or absent nested decoder config still advertises the backbone's
+        pre-extension vocabulary.  The generic sentinel check cannot detect that
+        shape mismatch, so this architecture always compares the actual module to
+        its tokenizer when resizing is enabled.
+        """
+        if not resize_token_embeddings:
+            return
+        if tokenizer is not None:
+            tokenizer.add_tokens(instance._get_special_tokens(), special_tokens=True)
+        instance.resize_embeddings()
+
     def set_class_indices(self):
         tokenizer = self.data_processor.transformer_tokenizer
         label_token_id = tokenizer.convert_tokens_to_ids(self.config.label_token)
@@ -3154,10 +3170,18 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
         tokenizer_size = len(self.data_processor.transformer_tokenizer)
         decoder_model = self.model.token_rep_layer.decoder_layer.model
         if decoder_model.get_input_embeddings().num_embeddings != tokenizer_size:
-            model_embeds = decoder_model.resize_token_embeddings(tokenizer_size)
-            self.config.vocab_size = model_embeds.num_embeddings
-            if self.config.decoder_config is not None:
-                self.config.decoder_config.vocab_size = model_embeds.num_embeddings
+            embedding_weight = decoder_model.get_input_embeddings().weight
+            if embedding_weight.is_meta:
+                # Mean/covariance initialization calls Tensor.item(), which is
+                # unavailable on shape-only meta tensors. Checkpoint loading
+                # replaces every resized row immediately afterward.
+                decoder_model.resize_token_embeddings(tokenizer_size, mean_resizing=False)
+            else:
+                decoder_model.resize_token_embeddings(tokenizer_size)
+        embedding_size = decoder_model.get_input_embeddings().num_embeddings
+        self.config.vocab_size = embedding_size
+        self.config.decoder_config = decoder_model.config
+        self.config.decoder_config.vocab_size = embedding_size
 
     def _get_freezable_components(self):
         components = super()._get_freezable_components()
@@ -3236,6 +3260,34 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
         compact = values[valid]
         return compact, torch.ones(compact.size(0), dtype=torch.bool, device=compact.device)
 
+    @staticmethod
+    def _merge_session_span_logits(
+        previous: Dict[Tuple[int, int], torch.Tensor],
+        model_output: Any,
+        *,
+        replace_all: bool = False,
+    ) -> Dict[Tuple[int, int], torch.Tensor]:
+        """Update the CPU span-score history with candidates from one session call."""
+        logits = model_output.logits
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.as_tensor(logits)
+        if logits.dim() == 4:
+            logits = logits.flatten(1, 2)
+        if logits.dim() != 3 or logits.size(0) != 1:
+            raise ValueError("Session span logits must have shape (1, num_spans, num_classes)")
+
+        span_idx = model_output.span_idx.view(1, -1, 2)
+        span_mask = model_output.span_mask.view(1, -1).bool()
+        if span_idx.size(1) != logits.size(1) or span_mask.size(1) != logits.size(1):
+            raise ValueError("Session span indices, mask, and logits must describe the same candidates")
+
+        valid_idx = span_idx[0, span_mask[0]].detach().cpu()
+        valid_logits = logits[0, span_mask[0]].detach().cpu()
+        merged = {} if replace_all else previous.copy()
+        for boundary, scores in zip(valid_idx.tolist(), valid_logits):
+            merged[(int(boundary[0]), int(boundary[1]))] = scores.clone()
+        return merged
+
     def _state_from_output(
         self,
         session_id,
@@ -3280,24 +3332,34 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
             tokens=list(tokens),
             char_starts=list(char_starts),
             char_ends=list(char_ends),
+            span_logits=self._merge_session_span_logits({}, model_output, replace_all=True),
         )
 
     def _decode_session_output(
         self,
-        model_output,
         state,
         threshold,
         flat_ner,
         multi_label,
         return_class_probs,
     ):
+        if not state.span_logits:
+            return []
+
         id_to_classes = {index + 1: label for index, label in enumerate(state.labels)}
+        ordered_scores = sorted(state.span_logits.items())
+        span_idx = torch.tensor(
+            [[boundary for boundary, _ in ordered_scores]],
+            dtype=torch.long,
+        )
+        span_logits = torch.stack([scores for _, scores in ordered_scores]).float().unsqueeze(0)
+        span_mask = torch.ones(span_idx.shape[:2], dtype=torch.bool)
         decoded = self.decoder.decode(
             [state.tokens],
             id_to_classes,
-            model_output.logits,
-            span_idx=model_output.span_idx,
-            span_mask=model_output.span_mask,
+            span_logits,
+            span_idx=span_idx,
+            span_mask=span_mask,
             flat_ner=flat_ner,
             threshold=threshold,
             multi_label=multi_label,
@@ -3387,11 +3449,15 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
             past_words = state.word_length
             new_words = len(current_tokens)
             recompute_spans = self.model.span_rep_layer.uses_bidirectional_context
+            right_context_width = getattr(self.config, "right_context_width", None)
+            if right_context_width is None:
+                right_context_width = self.config.max_width
             span_idx, span_mask = prepare_streaming_span_idx(
                 past_words,
                 new_words,
                 self.config.max_width,
                 recompute_all=recompute_spans,
+                right_context_width=right_context_width,
             )
             batch["span_idx"] = span_idx.unsqueeze(0).to(self.device)
             batch["span_mask"] = span_mask.unsqueeze(0).to(self.device)
@@ -3455,11 +3521,11 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
                 tokens=combined_tokens,
                 char_starts=combined_starts,
                 char_ends=combined_ends,
+                span_logits=self._merge_session_span_logits(state.span_logits, model_output),
             )
 
         self._session_cache.put(new_state)
         return self._decode_session_output(
-            model_output,
             new_state,
             threshold,
             flat_ner,
@@ -3483,6 +3549,14 @@ class DecoderSpanGLiNER(BaseEncoderGLiNER):
         recompute: bool = False,
         **external_inputs,
     ):
+        """Run stateless inference or append to cached streaming-span sessions.
+
+        Session calls reuse the causal decoder cache and rescore spans within
+        ``config.right_context_width`` of the newest word.  ``recompute=True``
+        takes precedence and refreshes every span over the combined session.
+        Returned entities are a complete session snapshot, including any
+        revisions or removals caused by the newly appended context.
+        """
         if session_id is None:
             return super().inference(
                 texts,
@@ -5141,8 +5215,8 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
     @staticmethod
     def _get_gliner_class(config: GLiNERConfig):
         """Determine the appropriate GLiNER class based on configuration."""
-        if isinstance(config, DecoderSpanConfig) or getattr(config, "model_type", None) == "gliner_decoder_span":
-            return DecoderSpanGLiNER
+        if isinstance(config, StreamingSpanConfig) or getattr(config, "model_type", None) == "gliner_streaming_span":
+            return StreamingSpanGLiNER
 
         is_token_level = config.span_mode == "token_level"
         has_labels_encoder = config.labels_encoder is not None
@@ -5179,8 +5253,8 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
         """Build the architecture-specific config encoded in a saved dictionary."""
         config_dict = config_dict.copy()
         model_type = config_dict.pop("model_type", None)
-        if model_type == "gliner_decoder_span":
-            return DecoderSpanConfig(**config_dict)
+        if model_type == "gliner_streaming_span":
+            return StreamingSpanConfig(**config_dict)
         return GLiNERConfig(**config_dict)
 
     @classmethod
@@ -5451,10 +5525,10 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             Dictionary mapping model types to their classes and descriptions.
         """
         return {
-            "gliner_decoder_span": {
-                "class": DecoderSpanGLiNER,
+            "gliner_streaming_span": {
+                "class": StreamingSpanGLiNER,
                 "description": "Streaming span NER with a causal decoder backbone",
-                "config": {"model_type": "gliner_decoder_span", "model_name": "required"},
+                "config": {"model_type": "gliner_streaming_span", "model_name": "required"},
             },
             "gliner_uni_encoder_span": {
                 "class": UniEncoderSpanGLiNER,
@@ -5536,7 +5610,7 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
             "UniEncoderTokenDecoderGLiNER": "gliner_uni_encoder_token_decoder",
             "UniEncoderSpanRelexGLiNER": "gliner_uni_encoder_span_relex",
             "UniEncoderTokenRelexGLiNER": "gliner_uni_encoder_token_relex",
-            "DecoderSpanGLiNER": "gliner_decoder_span",
+            "StreamingSpanGLiNER": "gliner_streaming_span",
         }
 
         return type_mapping.get(class_name, "unknown")

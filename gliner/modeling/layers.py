@@ -485,14 +485,14 @@ class LayersFuser(nn.Module):
 
         return output
 
-class DecoderLabelsEncoder(nn.Module):
+class StreamingSpanLabelsEncoder(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
 
         encoder_config = getattr(config, "labels_encoder_config", None)
         if encoder_config is None:
-            # Compatibility for config-like objects created before DecoderSpan
+            # Compatibility for config-like objects created before StreamingSpan
             # gained its dedicated nested label-encoder configuration.
             num_layers = getattr(config, "scorer_encoder_num_layers", 2)
             num_heads = max(1, config.hidden_size // 64)
@@ -526,7 +526,7 @@ class DecoderLabelsEncoder(nn.Module):
         """Compact each prompt from its first valid token through its first separator."""
         sep_token_id = getattr(self.config, "sep_token_index", -1)
         if sep_token_id < 0:
-            raise ValueError("DecoderLabelsEncoder requires config.sep_token_index to be set")
+            raise ValueError("StreamingSpanLabelsEncoder requires config.sep_token_index to be set")
 
         valid_mask = attention_mask.gt(0)
         sep_mask = input_ids.eq(sep_token_id) & valid_mask

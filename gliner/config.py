@@ -193,16 +193,19 @@ class UniEncoderTokenDecoderConfig(UniEncoderSpanDecoderConfig):
         self.represent_spans = True  # hardcoded to True for token decoder
 
 
-class DecoderSpanConfig(UniEncoderConfig):
+class StreamingSpanConfig(UniEncoderConfig):
     """Configuration for span NER backed directly by a causal decoder.
 
     Unlike :class:`UniEncoderSpanDecoderConfig`, the decoder is the text
     backbone itself rather than an auxiliary label-generation head.  A
     dedicated model type keeps the two architectures unambiguous when models
-    are saved and loaded through :class:`GLiNER`.
+    are saved and loaded through :class:`GLiNER`.  During cached inference,
+    ``right_context_width`` controls how many following words may revise a
+    span; when omitted it defaults to ``max_width``.  Set it to zero for the
+    previous append-only behavior.
     """
 
-    model_type = "gliner_decoder_span"
+    model_type = "gliner_streaming_span"
 
     def __init__(
         self,
@@ -214,6 +217,7 @@ class DecoderSpanConfig(UniEncoderConfig):
         span_context_encoder: str = "none",
         span_context_num_layers: int = 1,
         max_cache_length: Optional[int] = None,
+        right_context_width: Optional[int] = None,
         scorer_encoder_num_layers: Optional[int] = None,
         labels_decoder: Optional[str] = None,
         labels_decoder_config: Optional[dict] = None,
@@ -222,7 +226,7 @@ class DecoderSpanConfig(UniEncoderConfig):
         # ``labels_decoder`` used to identify this architecture's only
         # backbone.  Consume the old fields when loading an existing checkpoint
         # but do not retain or re-serialize them: ``model_name`` and
-        # ``decoder_config`` are the canonical fields for DecoderSpan models.
+        # ``decoder_config`` are the canonical fields for StreamingSpan models.
         default_model_name = "microsoft/deberta-v3-small"
         if labels_decoder is not None and (model_name is None or model_name == default_model_name):
             model_name = labels_decoder
@@ -254,7 +258,7 @@ class DecoderSpanConfig(UniEncoderConfig):
             labels_encoder_config = labels_encoder_config.copy()
             model_type = labels_encoder_config.pop("model_type", "deberta-v2")
             if model_type != "deberta-v2":
-                raise ValueError("DecoderSpan labels_encoder_config.model_type must be 'deberta-v2'")
+                raise ValueError("StreamingSpan labels_encoder_config.model_type must be 'deberta-v2'")
             labels_hidden_size = labels_encoder_config.setdefault("hidden_size", self.hidden_size)
             default_num_heads = max(1, labels_hidden_size // 64)
             while labels_hidden_size % default_num_heads:
@@ -294,6 +298,10 @@ class DecoderSpanConfig(UniEncoderConfig):
             raise ValueError("span_context_num_layers must be at least 1")
         if max_cache_length is not None and max_cache_length < 1:
             raise ValueError("max_cache_length must be positive when provided")
+        if right_context_width is None:
+            right_context_width = self.max_width
+        if right_context_width < 0:
+            raise ValueError("right_context_width must be non-negative")
 
         self.decoder_config = decoder_config
         self.labels_encoder_config = labels_encoder_config
@@ -302,7 +310,8 @@ class DecoderSpanConfig(UniEncoderConfig):
         self.span_context_encoder = span_context_encoder
         self.span_context_num_layers = span_context_num_layers
         self.max_cache_length = max_cache_length
-        self.model_type = "gliner_decoder_span"
+        self.right_context_width = right_context_width
+        self.model_type = "gliner_streaming_span"
 
 
 class UniEncoderRelexConfig(UniEncoderConfig):
@@ -489,7 +498,7 @@ CONFIG_MAPPING.update(
         "gliner_uni_encoder_token": UniEncoderTokenConfig,
         "gliner_uni_encoder_span_decoder": UniEncoderSpanDecoderConfig,
         "gliner_uni_encoder_token_decoder": UniEncoderTokenDecoderConfig,
-        "gliner_decoder_span": DecoderSpanConfig,
+        "gliner_streaming_span": StreamingSpanConfig,
         "gliner_uni_encoder_span_relex": UniEncoderSpanRelexConfig,
         "gliner_uni_encoder_token_relex": UniEncoderTokenRelexConfig,
         "gliner_bi_encoder": BiEncoderConfig,

@@ -33,14 +33,14 @@ from .utils import (
     extract_spans_from_tokens,
     extract_prompt_features_and_word_embeddings,
 )
-from .layers import CrossFuser, LstmSeq2SeqEncoder, DecoderLabelsEncoder, create_projection_layer
+from .layers import CrossFuser, LstmSeq2SeqEncoder, StreamingSpanLabelsEncoder, create_projection_layer
 from .decoder import Decoder
 from .encoder import Encoder, BiEncoder
 from .outputs import (
     GLiNERBaseOutput,
     GLiNERRelexOutput,
     GLiNERDecoderOutput,
-    GLiNERDecoderSpanOutput,
+    GLiNERStreamingSpanOutput,
     GLiNERRepresentationOutput,
 )
 from .scorers import Scorer
@@ -594,14 +594,14 @@ class UniEncoderSpanModel(BaseUniEncoderModel):
         return loss
 
 
-class DecoderSpanModel(UniEncoderSpanModel):
+class StreamingSpanModel(UniEncoderSpanModel):
     def __init__(
         self,
         config: Any,
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
     ) -> None:
-        """Initialize the decoder span model.
+        """Initialize the streaming span model.
 
         Args:
             config: Model configuration object.
@@ -611,7 +611,7 @@ class DecoderSpanModel(UniEncoderSpanModel):
         super().__init__(config, from_pretrained, cache_dir)
         if self.token_rep_layer.decoder_hidden_size != config.hidden_size:
             self.token_projection = nn.Linear(self.token_rep_layer.decoder_hidden_size, config.hidden_size)
-        self.labels_encoder = DecoderLabelsEncoder(config)
+        self.labels_encoder = StreamingSpanLabelsEncoder(config)
         self.span_rep_layer = SpanRepLayer(
             span_mode=config.span_mode,
             hidden_size=config.hidden_size,
@@ -627,7 +627,7 @@ class DecoderSpanModel(UniEncoderSpanModel):
         from_pretrained: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
     ) -> Decoder:
-        """Initialize the token representation layer for the decoder span model.
+        """Initialize the token representation layer for the streaming span model.
 
         Args:
             config: Model configuration object.
@@ -712,7 +712,15 @@ class DecoderSpanModel(UniEncoderSpanModel):
             **decoder_kwargs,
         )
         if hasattr(self, "token_projection"):
+            # A pretrained causal backbone may honor its source config's BF16
+            # dtype while newly initialized GLiNER projections remain FP32.
+            # Cross the module boundary in the receiving layer's dtype.
+            token_embeds = token_embeds.to(dtype=self.token_projection.weight.dtype)
             token_embeds = self.token_projection(token_embeds)
+
+        labels_encoder_dtype = next(self.labels_encoder.parameters()).dtype
+        if token_embeds.dtype != labels_encoder_dtype:
+            token_embeds = token_embeds.to(dtype=labels_encoder_dtype)
 
         batch_size, _, embed_dim = token_embeds.shape
         max_text_length = text_lengths.max()
@@ -791,7 +799,7 @@ class DecoderSpanModel(UniEncoderSpanModel):
         span_mask: Optional[torch.LongTensor] = None,
         labels: Optional[torch.FloatTensor] = None,
         **kwargs: Any,
-    ) -> GLiNERDecoderSpanOutput:
+    ) -> GLiNERStreamingSpanOutput:
         """Forward pass through the span-based model.
 
         Args:
@@ -815,7 +823,7 @@ class DecoderSpanModel(UniEncoderSpanModel):
             **kwargs: Additional arguments.
 
         Returns:
-            Cache-aware decoder span output.
+            Cache-aware streaming span output.
         """
         representation_kwargs = {
             key: kwargs[key]
@@ -886,7 +894,7 @@ class DecoderSpanModel(UniEncoderSpanModel):
                 **kwargs,
             )
 
-        output = GLiNERDecoderSpanOutput(
+        output = GLiNERStreamingSpanOutput(
             logits=scores,
             loss=loss,
             prompts_embedding=prompts_embedding,

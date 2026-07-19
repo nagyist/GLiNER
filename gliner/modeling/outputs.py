@@ -54,7 +54,7 @@ class GLiNERRepresentationOutput(ModelOutput):
 
 
 @dataclass
-class GLiNERDecoderSpanOutput(GLiNERBaseOutput):
+class GLiNERStreamingSpanOutput(GLiNERBaseOutput):
     """Span-classification output with reusable decoder and word cache state."""
 
     past_key_values: Optional[Any] = None

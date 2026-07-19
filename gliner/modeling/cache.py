@@ -16,7 +16,7 @@ def _empty_long() -> torch.Tensor:
 
 @dataclass
 class CacheState:
-    """All reusable state belonging to one decoder-span session."""
+    """All reusable state belonging to one streaming-span session."""
 
     past_key_values: Any = None
     input_ids: torch.Tensor = field(default_factory=_empty_long)
@@ -34,6 +34,7 @@ class CacheState:
     tokens: list[str] = field(default_factory=list)
     char_starts: list[int] = field(default_factory=list)
     char_ends: list[int] = field(default_factory=list)
+    span_logits: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -49,7 +50,7 @@ class CacheState:
         return len(self.tokens)
 
     def to(self, device: torch.device | str) -> CacheState:
-        """Return a copy whose tensor state is on ``device``."""
+        """Move reusable model tensors to ``device`` while keeping score history on CPU."""
         return replace(
             self,
             past_key_values=_move_past_kv(self.past_key_values, device),
@@ -65,6 +66,9 @@ class CacheState:
             tokens=list(self.tokens),
             char_starts=list(self.char_starts),
             char_ends=list(self.char_ends),
+            # Span scores intentionally remain on CPU so long-running sessions
+            # do not retain an ever-growing GPU prediction history.
+            span_logits=self.span_logits.copy(),
             metadata=self.metadata.copy(),
         )
 
