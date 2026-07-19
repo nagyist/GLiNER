@@ -270,16 +270,21 @@ class BaseProcessor(ABC):
             tokenized_inputs: Tokenized inputs from transformer tokenizer.
             skip_first_words: Optional list of word counts to skip per example
                 (e.g., prompt words).
-            token_level: If True, create token-level masks instead of word-level.
+            token_level: If True, assign word indices to every subtoken,
+                independently of the configured pooling strategy.
 
         Returns:
             Word mask array.
         """
+        subtoken_pooling = getattr(self.config, "subtoken_pooling", "first")
+        if not isinstance(subtoken_pooling, str):
+            subtoken_pooling = "first"
         return prepare_word_mask(
             texts,
             tokenized_inputs,
             skip_first_words=skip_first_words,
             token_level=token_level,
+            subtoken_pooling=subtoken_pooling,
         )
 
     def tokenize_inputs(self, texts, entities, blank=None, **kwargs):

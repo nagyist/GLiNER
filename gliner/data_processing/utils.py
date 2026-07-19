@@ -98,6 +98,7 @@ def prepare_word_mask(
     *,
     skip_first_words: Optional[Sequence[int]] = None,
     token_level: bool = False,
+    subtoken_pooling: str = "first",
 ) -> List[List[int]]:
     """Create word-level masks for subword tokenized sequences.
 
@@ -117,15 +118,16 @@ def prepare_word_mask(
         skip_first_words: Optional number of words to skip at the beginning of
             each sequence (e.g., prompt words). Must have the same length as texts
             if provided. Skipped words are masked as 0.
-        token_level: If True, assign a unique mask value to every token of a word
-            (enabling token-level granularity). If False, only the first subword
-            token of each word gets a mask value; continuation tokens are masked
-            as 0 (default: False).
+        token_level: If True, assign the word index to every subtoken, overriding
+            ``subtoken_pooling``. Defaults to False.
+        subtoken_pooling: Determines which subtokens receive a word index when
+            ``token_level`` is False: the first subtoken for ``first``, the last
+            for ``last``, or every subtoken for ``mean`` and ``max``.
 
     Returns:
         List of word mask lists, one per input sequence. Each mask list has the
         same length as the corresponding tokenized sequence. Values are:
-            - 0: Special tokens, skipped words, or continuation subwords
+            - 0: Special tokens, skipped words, or unselected subtokens
             - 1, 2, 3, ...: Word indices (1-indexed) after skipping
 
     Raises:
@@ -139,6 +141,11 @@ def prepare_word_mask(
         >>> # Result might be: [[0, 1, 0, 2, 0]]
         >>> #                   [CLS, Hel, ##lo, world, SEP]
     """
+    supported_pooling = {"first", "last", "mean", "max"}
+    if subtoken_pooling not in supported_pooling:
+        supported = ", ".join(sorted(supported_pooling))
+        raise ValueError(f"Unknown subtoken pooling strategy {subtoken_pooling!r}. Expected one of: {supported}")
+
     n = len(texts)
 
     if skip_first_words is None:
@@ -149,28 +156,33 @@ def prepare_word_mask(
     words_masks: List[List[int]] = []
 
     for i in range(n):
+        word_ids = tokenized_inputs.word_ids(i)
         mask: List[int] = []
         prev_word_id: Optional[int] = None
         seen_words = 0  # counts distinct word_ids we've traversed in this sequence
 
-        for wid in tokenized_inputs.word_ids(i):
+        for token_idx, wid in enumerate(word_ids):
             if wid is None:
                 # Special tokens (CLS, SEP, PAD, etc.)
                 mask.append(0)
-            elif wid != prev_word_id or token_level:
-                # If we just moved to a new word, update seen_words
-                if wid != prev_word_id:
+            else:
+                is_first_subtoken = wid != prev_word_id
+                if is_first_subtoken:
                     seen_words += 1
 
-                if seen_words <= skip_first_words[i]:
-                    # This word is in the skip range (e.g., prompt tokens)
+                next_word_id = word_ids[token_idx + 1] if token_idx + 1 < len(word_ids) else None
+                is_last_subtoken = next_word_id != wid
+                select_subtoken = (
+                    token_level
+                    or subtoken_pooling in {"mean", "max"}
+                    or (subtoken_pooling == "first" and is_first_subtoken)
+                    or (subtoken_pooling == "last" and is_last_subtoken)
+                )
+
+                if seen_words <= skip_first_words[i] or not select_subtoken:
                     mask.append(0)
                 else:
-                    # 1-based word index after skipping
                     mask.append(seen_words - skip_first_words[i])
-            else:
-                # same word continuation and token_level=False -> mask as 0
-                mask.append(0)
 
             prev_word_id = wid
 

@@ -356,6 +356,7 @@ class BaseUniEncoderModel(BaseModel):
             text_lengths,
             words_mask,
             self.config.embed_ent_token,
+            subtoken_pooling=getattr(self.config, "subtoken_pooling", "first"),
         )
         return prompts_embedding, prompts_embedding_mask, words_embedding, mask
 
@@ -390,7 +391,14 @@ class BaseUniEncoderModel(BaseModel):
             batch_size, _, embed_dim = token_embeds.shape
             max_text_length = text_lengths.max()
             words_embedding, mask = extract_word_embeddings(
-                token_embeds, words_mask, attention_mask, batch_size, max_text_length, embed_dim, text_lengths
+                token_embeds,
+                words_mask,
+                attention_mask,
+                batch_size,
+                max_text_length,
+                embed_dim,
+                text_lengths,
+                getattr(self.config, "subtoken_pooling", "first"),
             )
             prompts_embedding, prompts_embedding_mask = self.lookup_precomputed_prompts(
                 batch_size, device=token_embeds.device, rel=False
@@ -732,6 +740,7 @@ class StreamingSpanModel(UniEncoderSpanModel):
             max_text_length,
             embed_dim,
             text_lengths,
+            getattr(self.config, "subtoken_pooling", "first"),
         )
 
         use_precomputed = (
@@ -1224,7 +1233,14 @@ class BaseBiEncoderModel(BaseModel):
         max_text_length = text_lengths.max()
 
         words_embedding, mask = extract_word_embeddings(
-            token_embeds, words_mask, attention_mask, batch_size, max_text_length, embed_dim, text_lengths
+            token_embeds,
+            words_mask,
+            attention_mask,
+            batch_size,
+            max_text_length,
+            embed_dim,
+            text_lengths,
+            getattr(self.config, "subtoken_pooling", "first"),
         )
 
         labels_embeds = labels_embeds.unsqueeze(0)
@@ -2695,6 +2711,7 @@ class UniEncoderSpanRelexModel(UniEncoderSpanModel):
                 max_text_length,
                 embed_dim_e,
                 text_lengths,
+                getattr(self.config, "subtoken_pooling", "first"),
             )
             prompts_embedding, prompts_embedding_mask = self.lookup_precomputed_prompts(
                 batch_size_e, device=token_embeds.device, rel=False

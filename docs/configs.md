@@ -64,7 +64,20 @@ Whether to fine-tune the encoder during training.
 #### `subtoken_pooling`
 `str`, *optional*, defaults to `"first"`
 
-Currently only first token pooling is supported. More approaches will be added in the future.
+Controls how contextualized subtoken representations are combined into one word
+representation.
+
+**Available options:**
+
+- `"first"` — Uses the first subtoken representation. This is the default and
+  remains compatible with existing checkpoints.
+- `"last"` — Uses the last subtoken representation.
+- `"mean"` — Averages all subtoken representations belonging to the word.
+- `"max"` — Takes the element-wise maximum across all subtoken representations
+  belonging to the word.
+
+Use the same pooling strategy for training and inference. Changing this setting
+for an already-trained checkpoint can reduce prediction quality.
 
 ---
 

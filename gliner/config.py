@@ -3,6 +3,8 @@ from typing import Optional
 from transformers import DebertaV2Config, PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
 
+SUBTOKEN_POOLING_MODES = ("first", "last", "mean", "max")
+
 
 class BaseGLiNERConfig(PretrainedConfig):
     """Base configuration class for all GLiNER models."""
@@ -53,7 +55,8 @@ class BaseGLiNERConfig(PretrainedConfig):
             hidden_size (int, optional): Dimension of hidden representations. Defaults to 512.
             dropout (float, optional): Dropout probability. Defaults to 0.4.
             fine_tune (bool, optional): Whether to fine-tune the encoder. Defaults to True.
-            subtoken_pooling (str, optional): Subtoken pooling strategy. Defaults to "first".
+            subtoken_pooling (str, optional): Subtoken pooling strategy. One of
+                "first", "last", "mean", or "max". Defaults to "first".
             span_mode (str, optional): Span representation mode. Defaults to "markerV0".
             post_fusion_schema (str, optional): Post-fusion processing schema. Defaults to ''.
             num_post_fusion_layers (int, optional): Number of post-fusion layers. Defaults to 1.
@@ -92,6 +95,9 @@ class BaseGLiNERConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.dropout = dropout
         self.fine_tune = fine_tune
+        if subtoken_pooling not in SUBTOKEN_POOLING_MODES:
+            supported = ", ".join(SUBTOKEN_POOLING_MODES)
+            raise ValueError(f"Unknown subtoken pooling strategy {subtoken_pooling!r}. Expected one of: {supported}")
         self.subtoken_pooling = subtoken_pooling
         self.span_mode = span_mode
         self.post_fusion_schema = post_fusion_schema
