@@ -448,6 +448,7 @@ class UniEncoderSpanModel(BaseUniEncoderModel):
             hidden_size=config.hidden_size,
             max_width=config.max_width,
             dropout=config.dropout,
+            context_encoder_config=getattr(config, "span_encoder_config", None),
         )
 
         self.prompt_rep_layer = create_projection_layer(config.hidden_size, config.dropout)
@@ -625,8 +626,7 @@ class StreamingSpanModel(UniEncoderSpanModel):
             hidden_size=config.hidden_size,
             max_width=config.max_width,
             dropout=config.dropout,
-            context_encoder=getattr(config, "span_context_encoder", "none"),
-            context_num_layers=getattr(config, "span_context_num_layers", 1),
+            context_encoder_config=getattr(config, "span_encoder_config", None),
         )
 
     def _init_token_rep_layer(
@@ -949,6 +949,7 @@ class UniEncoderTokenModel(BaseUniEncoderModel):
                 hidden_size=config.hidden_size,
                 max_width=getattr(config, "max_width", 12),
                 dropout=config.dropout,
+                context_encoder_config=getattr(config, "span_encoder_config", None),
             )
 
     def get_span_representations(self, scores, span_idx, span_mask, words_embedding, labels, threshold):
@@ -1286,6 +1287,7 @@ class BiEncoderSpanModel(BaseBiEncoderModel):
             hidden_size=config.hidden_size,
             max_width=config.max_width,
             dropout=config.dropout,
+            context_encoder_config=getattr(config, "span_encoder_config", None),
         )
 
         self.prompt_rep_layer = create_projection_layer(config.hidden_size, config.dropout)

@@ -1,9 +1,123 @@
-from typing import Optional
+from typing import Union, Optional
 
-from transformers import DebertaV2Config, PretrainedConfig
+from transformers import DebertaV2Config, ModernBertConfig, PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
 
 SUBTOKEN_POOLING_MODES = ("first", "last", "mean", "max")
+CONTEXT_ENCODER_MODEL_TYPES = ("deberta-v2", "modernbert", "rnn")
+
+
+class RNNEncoderConfig(PretrainedConfig):
+    """Configuration for an RNN that contextualizes existing hidden states."""
+
+    model_type = "rnn"
+
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        num_hidden_layers: int = 1,
+        dropout: float = 0.0,
+        bidirectional: bool = True,
+        rnn_type: str = "lstm",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        rnn_type = rnn_type.lower()
+        if rnn_type != "lstm":
+            raise ValueError("RNN context encoders currently support only rnn_type='lstm'")
+        if hidden_size < 1:
+            raise ValueError("RNN encoder hidden_size must be positive")
+        if bidirectional and hidden_size % 2:
+            raise ValueError("Bidirectional RNN encoder hidden_size must be even")
+        if num_hidden_layers < 1:
+            raise ValueError("RNN encoder num_hidden_layers must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("RNN encoder dropout must be in the range [0, 1)")
+
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.dropout = dropout
+        self.bidirectional = bidirectional
+        self.rnn_type = rnn_type
+
+
+ContextEncoderConfig = Union[DebertaV2Config, ModernBertConfig, RNNEncoderConfig]
+
+
+def _default_num_attention_heads(hidden_size: int) -> int:
+    """Choose a practical attention-head count that divides ``hidden_size``."""
+    num_heads = max(1, hidden_size // 64)
+    while hidden_size % num_heads:
+        num_heads -= 1
+    return num_heads
+
+
+def normalize_context_encoder_config(
+    encoder_config: Optional[Union[dict, ContextEncoderConfig]],
+    *,
+    hidden_size: int,
+    dropout: float,
+    default_num_hidden_layers: int = 1,
+) -> Optional[ContextEncoderConfig]:
+    """Normalize configs shared by span and streaming-label context encoders."""
+    if encoder_config is None:
+        return None
+
+    if isinstance(encoder_config, dict):
+        values = encoder_config.copy()
+        model_type = values.pop("model_type", None)
+        if model_type not in CONTEXT_ENCODER_MODEL_TYPES:
+            supported = ", ".join(CONTEXT_ENCODER_MODEL_TYPES)
+            raise ValueError(f"Unknown context encoder model_type {model_type!r}. Expected one of: {supported}")
+
+        encoder_hidden_size = values.setdefault("hidden_size", hidden_size)
+        values.setdefault("num_hidden_layers", default_num_hidden_layers)
+
+        if model_type == "rnn":
+            values.setdefault("dropout", dropout)
+            encoder_config = RNNEncoderConfig(**values)
+        else:
+            values.setdefault("num_attention_heads", _default_num_attention_heads(encoder_hidden_size))
+            values.setdefault("intermediate_size", encoder_hidden_size * 4)
+            if model_type == "deberta-v2":
+                values.setdefault("hidden_dropout_prob", dropout)
+                values.setdefault("attention_probs_dropout_prob", dropout)
+                values.setdefault("relative_attention", True)
+                values.setdefault("pos_att_type", ["p2c", "c2p"])
+                values.setdefault("max_relative_positions", 512)
+                encoder_config = DebertaV2Config(**values)
+            else:
+                # ModernBERT is called with ``inputs_embeds``. Keep its unused
+                # token table tiny instead of allocating the default 50k rows.
+                values.setdefault("vocab_size", 1)
+                values.setdefault("pad_token_id", 0)
+                values.setdefault("bos_token_id", 0)
+                values.setdefault("eos_token_id", 0)
+                values.setdefault("cls_token_id", 0)
+                values.setdefault("sep_token_id", 0)
+                values.setdefault("attention_dropout", dropout)
+                values.setdefault("embedding_dropout", dropout)
+                values.setdefault("mlp_dropout", dropout)
+                encoder_config = ModernBertConfig(**values)
+    elif not isinstance(encoder_config, (DebertaV2Config, ModernBertConfig, RNNEncoderConfig)):
+        supported = ", ".join(config.__name__ for config in (DebertaV2Config, ModernBertConfig, RNNEncoderConfig))
+        raise TypeError(f"Context encoder config must be a dict or one of: {supported}")
+
+    if encoder_config.hidden_size < 1:
+        raise ValueError("Context encoder hidden_size must be positive")
+    if encoder_config.num_hidden_layers < 1:
+        raise ValueError("Context encoder num_hidden_layers must be positive")
+
+    if isinstance(encoder_config, (DebertaV2Config, ModernBertConfig)):
+        num_heads = encoder_config.num_attention_heads
+        if num_heads < 1:
+            raise ValueError("Context encoder num_attention_heads must be positive")
+        if encoder_config.hidden_size % num_heads:
+            raise ValueError("Context encoder hidden_size must be divisible by num_attention_heads")
+        if encoder_config.intermediate_size < 1:
+            raise ValueError("Context encoder intermediate_size must be positive")
+
+    return encoder_config
 
 
 class BaseGLiNERConfig(PretrainedConfig):
@@ -34,6 +148,7 @@ class BaseGLiNERConfig(PretrainedConfig):
         embed_ent_token: bool = True,
         class_token_index: int = -1,
         encoder_config: Optional[dict] = None,
+        span_encoder_config: Optional[dict] = None,
         ent_token: str = "<<ENT>>",
         sep_token: str = "<<SEP>>",
         _attn_implementation: Optional[str] = None,
@@ -70,6 +185,8 @@ class BaseGLiNERConfig(PretrainedConfig):
             embed_ent_token (bool, optional): Whether to embed entity tokens. Defaults to True.
             class_token_index (int, optional): Index of class token. Defaults to -1.
             encoder_config (dict, optional): Encoder configuration dict. Defaults to None.
+            span_encoder_config (dict, optional): Optional hidden-state encoder
+                applied before span representations. Defaults to None.
             ent_token (str, optional): Entity marker token. Defaults to "<<ENT>>".
             sep_token (str, optional): Separator token. Defaults to "<<SEP>>".
             _attn_implementation (str, optional): Attention implementation. Defaults to None.
@@ -88,6 +205,11 @@ class BaseGLiNERConfig(PretrainedConfig):
 
             encoder_config = CONFIG_MAPPING[encoder_config["model_type"]](**encoder_config)
         self.encoder_config = encoder_config
+        self.span_encoder_config = normalize_context_encoder_config(
+            span_encoder_config,
+            hidden_size=hidden_size,
+            dropout=dropout,
+        )
 
         self.model_name = model_name
         self.name = name
@@ -218,13 +340,11 @@ class StreamingSpanConfig(UniEncoderConfig):
         model_name: Optional[str] = None,
         decoder_config: Optional[dict] = None,
         labels_encoder_config: Optional[dict] = None,
+        span_encoder_config: Optional[dict] = None,
         label_token: str = "<<LABEL>>",
         sep_token_index: int = -1,
-        span_context_encoder: str = "none",
-        span_context_num_layers: int = 1,
         max_cache_length: Optional[int] = None,
         right_context_width: Optional[int] = None,
-        scorer_encoder_num_layers: Optional[int] = None,
         labels_decoder: Optional[str] = None,
         labels_decoder_config: Optional[dict] = None,
         **kwargs,
@@ -245,63 +365,23 @@ class StreamingSpanConfig(UniEncoderConfig):
             decoder_config["model_type"] = decoder_config.get("model_type", "gpt2")
             decoder_config = CONFIG_MAPPING[decoder_config["model_type"]](**decoder_config)
 
-        # Decoder streaming is causal by default.  Bidirectional word context
-        # is opt-in through ``span_context_encoder`` and lives in the span
-        # representation layer, so do not also create the legacy model-level
-        # BiLSTM unless a caller explicitly requests it.
+        # Decoder streaming is causal by default. Optional word context lives
+        # in the span representation layer, so do not also create the legacy
+        # model-level BiLSTM unless a caller explicitly requests it.
         kwargs.setdefault("num_rnn_layers", 0)
         kwargs.setdefault("span_mode", "markerV2")
-        super().__init__(model_name=model_name, **kwargs)
+        super().__init__(model_name=model_name, span_encoder_config=span_encoder_config, **kwargs)
 
-        # The label scorer is an independent DeBERTa-v2 encoder over the prompt
-        # slice.  Fill in architecture-compatible defaults while allowing its
-        # width, depth, heads, feed-forward size, and dropout to be configured
-        # independently from the decoder backbone.  The old flat layer-count
-        # field is accepted only for checkpoint migration.
+        # The default label scorer remains a compact, independent DeBERTa-v2
+        # encoder, but all supported context encoders use the same contract.
         if labels_encoder_config is None:
-            labels_encoder_config = {}
-        if isinstance(labels_encoder_config, dict):
-            labels_encoder_config = labels_encoder_config.copy()
-            model_type = labels_encoder_config.pop("model_type", "deberta-v2")
-            if model_type != "deberta-v2":
-                raise ValueError("StreamingSpan labels_encoder_config.model_type must be 'deberta-v2'")
-            labels_hidden_size = labels_encoder_config.setdefault("hidden_size", self.hidden_size)
-            default_num_heads = max(1, labels_hidden_size // 64)
-            while labels_hidden_size % default_num_heads:
-                default_num_heads -= 1
-            labels_encoder_config.setdefault(
-                "num_hidden_layers",
-                scorer_encoder_num_layers if scorer_encoder_num_layers is not None else 2,
-            )
-            labels_encoder_config.setdefault("num_attention_heads", default_num_heads)
-            labels_encoder_config.setdefault("intermediate_size", labels_hidden_size * 4)
-            labels_encoder_config.setdefault("relative_attention", True)
-            labels_encoder_config.setdefault("pos_att_type", ["p2c", "c2p"])
-            labels_encoder_config.setdefault("max_relative_positions", 512)
-            labels_encoder_config = DebertaV2Config(**labels_encoder_config)
-        elif not isinstance(labels_encoder_config, DebertaV2Config):
-            raise TypeError("labels_encoder_config must be a dict or DebertaV2Config")
-
-        labels_hidden_size = labels_encoder_config.hidden_size
-        labels_num_heads = labels_encoder_config.num_attention_heads
-        if labels_hidden_size < 1:
-            raise ValueError("labels_encoder_config.hidden_size must be positive")
-        if labels_num_heads < 1:
-            raise ValueError("labels_encoder_config.num_attention_heads must be positive")
-        if labels_hidden_size % labels_num_heads:
-            raise ValueError(
-                "labels_encoder_config.hidden_size must be divisible by "
-                "labels_encoder_config.num_attention_heads"
-            )
-        if labels_encoder_config.num_hidden_layers < 1:
-            raise ValueError("labels_encoder_config.num_hidden_layers must be positive")
-        if labels_encoder_config.intermediate_size < 1:
-            raise ValueError("labels_encoder_config.intermediate_size must be positive")
-
-        if span_context_encoder not in {"none", "bilstm"}:
-            raise ValueError("span_context_encoder must be either 'none' or 'bilstm'")
-        if span_context_num_layers < 1:
-            raise ValueError("span_context_num_layers must be at least 1")
+            labels_encoder_config = {"model_type": "deberta-v2", "num_hidden_layers": 2}
+        labels_encoder_config = normalize_context_encoder_config(
+            labels_encoder_config,
+            hidden_size=self.hidden_size,
+            dropout=self.dropout,
+            default_num_hidden_layers=2,
+        )
         if max_cache_length is not None and max_cache_length < 1:
             raise ValueError("max_cache_length must be positive when provided")
         if right_context_width is None:
@@ -313,8 +393,6 @@ class StreamingSpanConfig(UniEncoderConfig):
         self.labels_encoder_config = labels_encoder_config
         self.label_token = label_token
         self.sep_token_index = sep_token_index
-        self.span_context_encoder = span_context_encoder
-        self.span_context_num_layers = span_context_num_layers
         self.max_cache_length = max_cache_length
         self.right_context_width = right_context_width
         self.model_type = "gliner_streaming_span"

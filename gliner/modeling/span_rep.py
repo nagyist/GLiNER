@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .layers import LstmSeq2SeqEncoder, create_projection_layer
+from .layers import create_projection_layer
+from .context_encoders import build_context_encoder
 
 
 class SpanQuery(nn.Module):
@@ -752,8 +751,7 @@ class SpanRepLayer(nn.Module):
         hidden_size,
         max_width,
         span_mode,
-        context_encoder="none",
-        context_num_layers=1,
+        context_encoder_config=None,
         **kwargs,
     ):
         """Initialize the SpanRepLayer with the specified mode.
@@ -774,10 +772,8 @@ class SpanRepLayer(nn.Module):
                 - 'conv_mean': SpanConv with mean pooling
                 - 'conv_sum': SpanConv with sum pooling
                 - 'conv_share': ConvShare
-            context_encoder (str): Optional word context encoder. Supported
-                values are ``'none'`` and ``'bilstm'``.
-            context_num_layers (int): Number of layers in the optional context
-                encoder.
+            context_encoder_config: Optional DeBERTa-v2, ModernBERT, or RNN
+                context-encoder configuration.
             **kwargs: Additional arguments passed to the span representation layer.
 
         Raises:
@@ -785,18 +781,12 @@ class SpanRepLayer(nn.Module):
         """
         super().__init__()
 
-        self.context_encoder_name = context_encoder
-        if context_encoder == "none":
-            self.context_encoder = None
-        elif context_encoder == "bilstm":
-            context_config = SimpleNamespace(hidden_size=hidden_size)
-            self.context_encoder = LstmSeq2SeqEncoder(
-                context_config,
-                num_layers=context_num_layers,
-                dropout=kwargs.get("dropout", 0.0) if context_num_layers > 1 else 0.0,
-            )
-        else:
-            raise ValueError(f"Unknown span context encoder {context_encoder}")
+        self.context_encoder = build_context_encoder(
+            context_encoder_config,
+            input_size=hidden_size,
+            output_size=hidden_size,
+            dropout=kwargs.get("dropout", 0.0),
+        )
 
         if span_mode == "marker":
             self.span_rep_layer = SpanMarker(hidden_size, max_width, **kwargs)
@@ -830,7 +820,7 @@ class SpanRepLayer(nn.Module):
     @property
     def uses_bidirectional_context(self) -> bool:
         """Whether all historical words are re-contextualized on every call."""
-        return self.context_encoder is not None
+        return self.context_encoder.requires_full_recompute
 
     def forward(self, x, span_idx, word_mask=None, return_words=False):
         """Forward pass through the selected span representation layer.
@@ -845,11 +835,9 @@ class SpanRepLayer(nn.Module):
             torch.Tensor: Span representations, typically of shape
                 [B, L, max_width, D].
         """
-        contextualized = x
-        if self.context_encoder is not None:
-            if word_mask is None:
-                word_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
-            contextualized = self.context_encoder(x, word_mask)
+        if word_mask is None:
+            word_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+        contextualized = self.context_encoder(x, word_mask)
 
         if isinstance(self.span_rep_layer, SpanMarkerV2):
             span_rep = self.span_rep_layer(contextualized, span_idx, word_mask)

@@ -219,7 +219,7 @@ def extract_prompt_features(
               Shape: (batch_size, max_num_types)
     """
     # Find all positions with the class token
-    class_token_mask = input_ids == class_token_index
+    class_token_mask = input_ids.eq(class_token_index) & attention_mask.gt(0)
     num_class_tokens = torch.sum(class_token_mask, dim=-1, keepdim=True)
 
     # Maximum number of class tokens across batch
