@@ -650,17 +650,37 @@ class StreamingSpanModel(UniEncoderSpanModel):
         past_word_mask: torch.Tensor,
         current_word_embeddings: torch.Tensor,
         current_word_mask: torch.Tensor,
+        past_word_length: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Append current words while keeping valid positions compact per sample."""
-        combined_embeddings = torch.cat([past_word_embeddings, current_word_embeddings], dim=1)
-        combined_mask = torch.cat([past_word_mask, current_word_mask], dim=1).bool()
-        merged_embeddings = combined_embeddings.new_zeros(combined_embeddings.shape)
-        merged_mask = combined_mask.new_zeros(combined_mask.shape)
+        """Append words into reusable capacity-backed storage."""
+        current_word_length = current_word_embeddings.size(1)
+        required = past_word_length + current_word_length
+        capacity = past_word_embeddings.size(1)
 
-        batch_indices, source_indices = combined_mask.nonzero(as_tuple=True)
-        target_indices = (combined_mask.long().cumsum(dim=1) - 1)[batch_indices, source_indices]
-        merged_embeddings[batch_indices, target_indices] = combined_embeddings[batch_indices, source_indices]
-        merged_mask[batch_indices, target_indices] = True
+        if required > capacity:
+            new_capacity = max(required, max(1, capacity) * 2)
+            merged_embeddings = past_word_embeddings.new_empty(
+                past_word_embeddings.size(0),
+                new_capacity,
+                past_word_embeddings.size(2),
+            )
+            merged_mask = torch.zeros(
+                past_word_mask.size(0),
+                new_capacity,
+                dtype=torch.bool,
+                device=past_word_mask.device,
+            )
+            if past_word_length:
+                active = slice(0, past_word_length)
+                merged_embeddings[:, active].copy_(past_word_embeddings[:, active])
+                merged_mask[:, active] = past_word_mask[:, active]
+        else:
+            merged_embeddings = past_word_embeddings
+            merged_mask = past_word_mask
+
+        destination = slice(past_word_length, required)
+        merged_embeddings[:, destination].copy_(current_word_embeddings)
+        merged_mask[:, destination] = current_word_mask.bool()
         return merged_embeddings, merged_mask
 
     def get_representations(
@@ -698,6 +718,7 @@ class StreamingSpanModel(UniEncoderSpanModel):
             Structured prompt, word, and cache representations.
         """
         word_lengths = kwargs.pop("word_lengths", None)
+        past_word_length = kwargs.pop("past_word_length", None)
         label_attention_mask = kwargs.pop("label_mask", label_attention_mask)
         if input_ids is None or attention_mask is None:
             raise ValueError("input_ids and attention_mask are required")
@@ -764,26 +785,34 @@ class StreamingSpanModel(UniEncoderSpanModel):
         if past_word_embeddings is not None:
             if past_word_mask is None:
                 raise ValueError("past_word_mask is required with past_word_embeddings")
+            if past_word_length is None:
+                past_word_length = int(past_word_mask.long().sum(dim=1).max().item())
             cached_words_embedding, cached_word_mask = self._merge_cached_words(
                 past_word_embeddings,
                 past_word_mask,
                 current_words_embedding,
                 current_word_mask,
+                past_word_length,
             )
+            active_word_length = past_word_length + current_words_embedding.size(1)
         else:
             cached_words_embedding = current_words_embedding
             cached_word_mask = current_word_mask
+            active_word_length = current_words_embedding.size(1)
 
-        words_embedding = cached_words_embedding
+        active = slice(0, active_word_length)
+        active_words_embedding = cached_words_embedding[:, active]
+        active_word_mask = cached_word_mask[:, active]
+        words_embedding = active_words_embedding
         if hasattr(self, "rnn"):
             rnn_lengths = word_lengths if past_word_embeddings is None else None
-            words_embedding = self.rnn(words_embedding, cached_word_mask, lengths=rnn_lengths)
+            words_embedding = self.rnn(words_embedding, active_word_mask, lengths=rnn_lengths)
 
         return GLiNERRepresentationOutput(
             prompts_embedding=prompts_embedding,
             prompts_embedding_mask=prompts_embedding_mask,
             words_embedding=words_embedding,
-            mask=cached_word_mask,
+            mask=active_word_mask,
             past_key_values=past_key_values,
             past_word_embeddings=cached_words_embedding,
             past_word_mask=cached_word_mask,
@@ -834,9 +863,16 @@ class StreamingSpanModel(UniEncoderSpanModel):
         Returns:
             Cache-aware streaming span output.
         """
+        compact_cached_words = kwargs.get("past_word_length") is not None
         representation_kwargs = {
             key: kwargs[key]
-            for key in ("position_ids", "cache_position", "use_cache", "word_lengths")
+            for key in (
+                "position_ids",
+                "cache_position",
+                "use_cache",
+                "word_lengths",
+                "past_word_length",
+            )
             if key in kwargs
         }
 
@@ -878,6 +914,7 @@ class StreamingSpanModel(UniEncoderSpanModel):
             safe_span_idx,
             word_mask=mask,
             return_words=True,
+            compact_words=compact_cached_words,
         )
 
         cached_prompts_embedding = prompts_embedding

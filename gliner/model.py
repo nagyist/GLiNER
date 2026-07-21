@@ -77,7 +77,12 @@ from .modeling.base import (
     UniEncoderSpanDecoderModel,
     UniEncoderTokenDecoderModel,
 )
-from .modeling.cache import CacheState, SessionCacheManager, copy_past_key_values
+from .modeling.cache import (
+    DEFAULT_CACHE_INITIAL_CAPACITY,
+    CacheState,
+    SessionCacheManager,
+    create_reusable_cache,
+)
 from .modeling.utils import extract_prompt_features
 from .data_processing import (
     BaseProcessor,
@@ -3246,6 +3251,13 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
             return backbone_limit
         return min(configured, backbone_limit) if backbone_limit is not None else configured
 
+    def _create_session_cache(self):
+        decoder_config = self.model.token_rep_layer.decoder_layer.model.config
+        return create_reusable_cache(
+            decoder_config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+
     def _validate_context_length(self, length: int, session_id: str) -> None:
         limit = self._decoder_context_limit()
         if limit is not None and length > limit:
@@ -3259,6 +3271,20 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         valid = mask.bool()
         compact = values[valid]
         return compact, torch.ones(compact.size(0), dtype=torch.bool, device=compact.device)
+
+    @staticmethod
+    def _reserve_word_cache(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = mask.bool()
+        compact = values[valid]
+        capacity = max(DEFAULT_CACHE_INITIAL_CAPACITY, compact.size(0))
+        storage = compact.new_empty(capacity, compact.size(-1))
+        storage_mask = torch.zeros(capacity, dtype=torch.bool, device=compact.device)
+        storage[: compact.size(0)].copy_(compact)
+        storage_mask[: compact.size(0)] = True
+        return storage, storage_mask
 
     @staticmethod
     def _merge_session_span_logits(
@@ -3306,7 +3332,7 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         input_ids = batch["input_ids"][0][valid_tokens]
         token_word_mask = batch["words_mask"][0][valid_tokens]
 
-        raw_words, raw_word_mask = self._compact_row(
+        raw_words, raw_word_mask = self._reserve_word_cache(
             model_output.past_word_embeddings[0],
             model_output.past_word_mask[0],
         )
@@ -3424,7 +3450,7 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
             }
             token_count = int(batch["attention_mask"].sum().item())
             self._validate_context_length(token_count, session_id)
-            model_output = self.model(**batch)
+            model_output = self.model(**batch, past_key_values=self._create_session_cache())
             batch["label_attention_mask"] = batch["attention_mask"]
             new_state = self._state_from_output(
                 session_id,
@@ -3472,30 +3498,38 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
                 cached.next_position + batch["input_ids"].size(1),
                 device=self.device,
             ).unsqueeze(0)
-            model_output = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=full_attention,
-                label_attention_mask=current_attention,
-                past_key_values=copy_past_key_values(cached.past_key_values),
-                past_word_embeddings=cached.past_word_embeddings.unsqueeze(0),
-                past_word_mask=cached.past_word_mask.unsqueeze(0),
-                prompts_embedding=cached.prompts_embedding.unsqueeze(0),
-                prompts_embedding_mask=cached.prompts_mask.unsqueeze(0),
-                words_mask=batch["words_mask"],
-                text_lengths=batch["text_lengths"],
-                span_idx=batch["span_idx"],
-                span_mask=batch["span_mask"],
-                position_ids=position_ids,
-            )
+            try:
+                model_output = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=full_attention,
+                    label_attention_mask=current_attention,
+                    # Same-device CacheState.to() returns this exact cache object.
+                    # ReusableDynamicLayer writes only the newly appended KV slice
+                    # and retains its backing storage until a capacity boundary.
+                    past_word_length=past_words,
+                    past_key_values=cached.past_key_values,
+                    past_word_embeddings=cached.past_word_embeddings.unsqueeze(0),
+                    past_word_mask=cached.past_word_mask.unsqueeze(0),
+                    prompts_embedding=cached.prompts_embedding.unsqueeze(0),
+                    prompts_embedding_mask=cached.prompts_mask.unsqueeze(0),
+                    words_mask=batch["words_mask"],
+                    text_lengths=batch["text_lengths"],
+                    span_idx=batch["span_idx"],
+                    span_mask=batch["span_mask"],
+                    position_ids=position_ids,
+                )
+            except Exception:
+                # KV layers append in place, so a partially failed decoder pass
+                # cannot safely be retried from the previous session metadata.
+                self.clear_session(session_id)
+                raise
 
             valid_current = current_attention[0].bool()
             current_ids = batch["input_ids"][0][valid_current]
             current_word_mask = batch["words_mask"][0][valid_current].clone()
             current_word_mask[current_word_mask > 0] += past_words
-            raw_words, raw_word_mask = self._compact_row(
-                model_output.past_word_embeddings[0],
-                model_output.past_word_mask[0],
-            )
+            raw_words = model_output.past_word_embeddings[0]
+            raw_word_mask = model_output.past_word_mask[0]
             raw_prompts, prompt_mask = self._compact_row(
                 model_output.cached_prompts_embedding[0],
                 model_output.cached_prompts_mask[0],

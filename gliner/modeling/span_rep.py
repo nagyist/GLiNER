@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .layers import create_projection_layer
-from .context_encoders import build_context_encoder
+from .context_encoders import IdentityContextEncoder, build_context_encoder
 
 
 class SpanQuery(nn.Module):
@@ -822,7 +822,14 @@ class SpanRepLayer(nn.Module):
         """Whether all historical words are re-contextualized on every call."""
         return self.context_encoder.requires_full_recompute
 
-    def forward(self, x, span_idx, word_mask=None, return_words=False):
+    def forward(
+        self,
+        x,
+        span_idx,
+        word_mask=None,
+        return_words=False,
+        compact_words=False,
+    ):
         """Forward pass through the selected span representation layer.
 
         Args:
@@ -830,6 +837,8 @@ class SpanRepLayer(nn.Module):
             span_idx (torch.Tensor): Flattened absolute start/end span indices.
             word_mask (torch.Tensor, optional): Mask for valid word embeddings.
             return_words (bool): Return contextualized words alongside spans.
+            compact_words (bool): The supplied words are a valid compact prefix,
+                allowing the identity context encoder to return its input view.
 
         Returns:
             torch.Tensor: Span representations, typically of shape
@@ -837,7 +846,10 @@ class SpanRepLayer(nn.Module):
         """
         if word_mask is None:
             word_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
-        contextualized = self.context_encoder(x, word_mask)
+        if compact_words and isinstance(self.context_encoder, IdentityContextEncoder):
+            contextualized = x
+        else:
+            contextualized = self.context_encoder(x, word_mask)
 
         if isinstance(self.span_rep_layer, SpanMarkerV2):
             span_rep = self.span_rep_layer(contextualized, span_idx, word_mask)

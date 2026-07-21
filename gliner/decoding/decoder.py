@@ -586,53 +586,104 @@ class SpanDecoder(BaseSpanDecoder):
         flat_values = _expand_batch_param(flat_ner, batch_size, "flat_ner")
         multi_values = _expand_batch_param(multi_label, batch_size, "multi_label")
 
-        probabilities_cpu = probabilities.tolist()
-        span_idx_cpu = span_idx.tolist()
-        span_mask_cpu = span_mask.tolist()
-        decoded = []
-        for batch_idx in range(batch_size):
-            id_to_class = self._get_id_to_class_for_sample(id_to_classes, batch_idx)
-            allowed = set(input_spans[batch_idx]) if input_spans is not None else None
-            candidates = []
-            for span_pos, valid in enumerate(span_mask_cpu[batch_idx]):
-                if not valid:
+        valid_spans = span_mask.clone()
+        if input_spans is not None:
+            if len(input_spans) != batch_size:
+                raise ValueError("input_spans must have one entry per batch item")
+            for batch_idx, allowed_spans in enumerate(input_spans):
+                if allowed_spans is None:
                     continue
-                start, end = span_idx_cpu[batch_idx][span_pos]
-                if allowed is not None and (start, end) not in allowed:
-                    continue
-                class_scores = probabilities_cpu[batch_idx][span_pos]
-                for class_idx in range(num_classes):
-                    score = class_scores[class_idx]
-                    if score <= thresholds[batch_idx] or class_idx + 1 not in id_to_class:
-                        continue
-                    class_probs = None
-                    if return_class_probs:
-                        top_indices = sorted(
-                            range(num_classes),
-                            key=class_scores.__getitem__,
-                            reverse=True,
-                        )[:5]
-                        class_probs = {
-                            id_to_class.get(index + 1, f"class_{index}"): class_scores[index]
-                            for index in top_indices
-                        }
-                    candidates.append(
-                        Span(
-                            start=start,
-                            end=end,
-                            entity_type=id_to_class[class_idx + 1],
-                            score=score,
-                            class_probs=class_probs,
-                        )
+                allowed_mask = torch.zeros_like(valid_spans[batch_idx])
+                for start, end in set(allowed_spans):
+                    allowed_mask |= (span_idx[batch_idx, :, 0] == start) & (
+                        span_idx[batch_idx, :, 1] == end
                     )
-            decoded.append(
-                self.greedy_search(
-                    candidates,
-                    flat_values[batch_idx],
-                    multi_label=multi_values[batch_idx],
+                valid_spans[batch_idx] &= allowed_mask
+
+        id_to_class_per_item = [
+            self._get_id_to_class_for_sample(id_to_classes, batch_idx)
+            for batch_idx in range(batch_size)
+        ]
+        valid_classes = torch.tensor(
+            [
+                [class_idx + 1 in id_to_class for class_idx in range(num_classes)]
+                for id_to_class in id_to_class_per_item
+            ],
+            dtype=torch.bool,
+            device=probabilities.device,
+        )
+
+        threshold_tensor = torch.as_tensor(
+            thresholds,
+            dtype=probabilities.dtype,
+            device=probabilities.device,
+        ).view(batch_size, 1, 1)
+        candidate_mask = (
+            valid_spans.unsqueeze(-1)
+            & valid_classes.unsqueeze(1)
+            & (probabilities > threshold_tensor)
+        )
+        batch_indices, span_positions, class_indices = torch.where(candidate_mask)
+        if batch_indices.numel() == 0:
+            return [[] for _ in range(batch_size)]
+
+        candidate_boundaries = span_idx[batch_indices, span_positions]
+        candidate_scores = probabilities[batch_indices, span_positions, class_indices]
+        index_rows = (
+            torch.column_stack((batch_indices, candidate_boundaries, class_indices))
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        score_rows = candidate_scores.detach().cpu().tolist()
+
+        top_prob_rows = None
+        top_index_rows = None
+        if return_class_probs:
+            candidate_probabilities = probabilities[batch_indices, span_positions]
+            top_k = min(5, num_classes)
+            top_indices = torch.argsort(
+                candidate_probabilities,
+                dim=-1,
+                descending=True,
+                stable=True,
+            )[:, :top_k]
+            top_probabilities = torch.gather(candidate_probabilities, 1, top_indices)
+            top_prob_rows = top_probabilities.detach().cpu().tolist()
+            top_index_rows = top_indices.detach().cpu().tolist()
+
+        candidates_by_batch = [[] for _ in range(batch_size)]
+        for row_index, ((batch_idx, start, end, class_idx), score) in enumerate(
+            zip(index_rows, score_rows)
+        ):
+            id_to_class = id_to_class_per_item[batch_idx]
+            class_probs = None
+            if return_class_probs:
+                class_probs = {
+                    id_to_class.get(index + 1, f"class_{index}"): probability
+                    for index, probability in zip(
+                        top_index_rows[row_index],
+                        top_prob_rows[row_index],
+                    )
+                }
+            candidates_by_batch[batch_idx].append(
+                Span(
+                    start=start,
+                    end=end,
+                    entity_type=id_to_class[class_idx + 1],
+                    score=score,
+                    class_probs=class_probs,
                 )
             )
-        return decoded
+
+        return [
+            self.greedy_search(
+                candidates,
+                flat_values[batch_idx],
+                multi_label=multi_values[batch_idx],
+            )
+            for batch_idx, candidates in enumerate(candidates_by_batch)
+        ]
 
     def decode(
         self,

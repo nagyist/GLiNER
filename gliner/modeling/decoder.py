@@ -105,6 +105,12 @@ class DecoderTransformer(nn.Module):
         if decoder_config is None:
             decoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
 
+        # Decoder backbones are constructed separately from encoder backbones,
+        # so explicitly propagate GLiNER's top-level attention override.
+        attn_implementation = getattr(config, "_attn_implementation", None)
+        if attn_implementation is not None:
+            decoder_config._attn_implementation = attn_implementation
+
         is_streaming_span = getattr(config, "model_type", None) == "gliner_streaming_span"
         saved_vocab_size = getattr(config, "vocab_size", -1)
         if is_streaming_span and not from_pretrained and saved_vocab_size > 0:
@@ -116,7 +122,13 @@ class DecoderTransformer(nn.Module):
         model_class = AutoModelForCausalLM if use_causal_lm else AutoModel
 
         if from_pretrained:
-            self.model = model_class.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
+            model_kwargs = {
+                "cache_dir": cache_dir,
+                "trust_remote_code": True,
+            }
+            if attn_implementation is not None:
+                model_kwargs["attn_implementation"] = attn_implementation
+            self.model = model_class.from_pretrained(model_name, **model_kwargs)
         else:
             self.model = model_class.from_config(decoder_config, trust_remote_code=True)
 
