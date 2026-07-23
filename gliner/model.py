@@ -6,6 +6,7 @@ import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Tuple, Union, Optional
 from pathlib import Path
+from threading import RLock
 
 import torch
 import onnxruntime as ort
@@ -23,6 +24,7 @@ from huggingface_hub import (
 )
 from torch.utils.data import DataLoader
 from safetensors.torch import save_file
+from torch.nn.utils.rnn import pad_sequence
 from huggingface_hub.errors import EntryNotFoundError
 
 try:
@@ -53,6 +55,7 @@ from .decoding import (
     TokenGenerativeDecoder,
 )
 from .training import Trainer, TrainingArguments
+from .streaming import StreamingBatch, AsyncStreamingEngine, _PersistentBatchState
 from .evaluation import BaseNEREvaluator, BaseRelexEvaluator
 from .onnx.model import (
     BaseORTModel,
@@ -82,6 +85,8 @@ from .modeling.cache import (
     CacheState,
     SessionCacheManager,
     create_reusable_cache,
+    split_past_key_values,
+    stack_past_key_values,
 )
 from .modeling.utils import extract_prompt_features
 from .data_processing import (
@@ -3120,6 +3125,7 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._session_cache = SessionCacheManager()
+        self._stream_execution_lock = RLock()
 
     @classmethod
     def _get_tokenizer_source(cls, config):
@@ -3202,32 +3208,104 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         """Remove every cached inference session."""
         self._session_cache.clear()
 
+    def create_streaming_batch(self, session_ids: List[str], labels: List[str]):
+        """Create a persistent fixed-order streaming batch."""
+        return StreamingBatch(self, session_ids, labels)
+
+    def create_async_streaming_engine(
+        self,
+        *,
+        max_batch_size: int = 32,
+        batch_wait_timeout_ms: float = 2.0,
+        queue_capacity: int = 4096,
+    ):
+        """Create an asynchronous dynamic-microbatch streaming engine."""
+        return AsyncStreamingEngine(
+            self,
+            max_batch_size=max_batch_size,
+            batch_wait_timeout_ms=batch_wait_timeout_ms,
+            queue_capacity=queue_capacity,
+        )
+
     @property
     def session_count(self) -> int:
         """Return the number of currently cached sessions."""
         return len(self._session_cache)
 
     def _collate_session_tokens(self, tokens, labels, include_prompt):
-        class_to_id = {label: index + 1 for index, label in enumerate(labels)}
-        id_to_classes = {index: label for label, index in class_to_id.items()}
-        span_idx, span_mask = prepare_streaming_span_idx(
-            0,
-            len(tokens),
-            self.config.max_width,
-            recompute_all=True,
+        return self._collate_session_batch(
+            [list(tokens)],
+            [list(labels)],
+            include_prompt=include_prompt,
+        )
+
+    def _collate_session_batch(
+        self,
+        tokens_batch,
+        labels_batch,
+        *,
+        include_prompt,
+        span_candidates=None,
+    ):
+        """Collate one streaming step for multiple independent session rows."""
+        if len(tokens_batch) != len(labels_batch):
+            raise ValueError("tokens_batch and labels_batch must have the same length")
+        if not tokens_batch:
+            raise ValueError("At least one streaming row is required")
+
+        include_flags = (
+            [include_prompt] * len(tokens_batch)
+            if isinstance(include_prompt, bool)
+            else list(include_prompt)
+        )
+        if len(include_flags) != len(tokens_batch):
+            raise ValueError("include_prompt must have one value per streaming row")
+
+        class_to_ids = []
+        id_to_classes = []
+        for labels in labels_batch:
+            class_to_id = {label: index + 1 for index, label in enumerate(labels)}
+            class_to_ids.append(class_to_id)
+            id_to_classes.append({index: label for label, index in class_to_id.items()})
+
+        if span_candidates is None:
+            span_candidates = [
+                prepare_streaming_span_idx(
+                    0,
+                    len(tokens),
+                    self.config.max_width,
+                    recompute_all=True,
+                )
+                for tokens in tokens_batch
+            ]
+        if len(span_candidates) != len(tokens_batch):
+            raise ValueError("span_candidates must have one value per streaming row")
+
+        span_idx = pad_sequence(
+            [candidate[0] for candidate in span_candidates],
+            batch_first=True,
+            padding_value=0,
+        )
+        span_mask = pad_sequence(
+            [candidate[1].bool() for candidate in span_candidates],
+            batch_first=True,
+            padding_value=False,
         )
         raw_batch = {
-            "tokens": [list(tokens)],
-            "classes_to_id": class_to_id,
+            "tokens": [list(tokens) for tokens in tokens_batch],
+            "classes_to_id": class_to_ids,
             "id_to_classes": id_to_classes,
-            "span_idx": span_idx.unsqueeze(0),
-            "span_mask": span_mask.unsqueeze(0),
-            "seq_length": torch.tensor([[len(tokens)]], dtype=torch.long),
+            "span_idx": span_idx,
+            "span_mask": span_mask,
+            "seq_length": torch.tensor(
+                [[len(tokens)] for tokens in tokens_batch],
+                dtype=torch.long,
+            ),
         }
         model_input = self.data_processor.collate_fn(
             raw_batch,
             prepare_labels=False,
-            include_prompt=include_prompt,
+            include_prompt=include_flags,
             truncation=False,
         )
         model_input.update(
@@ -3292,6 +3370,8 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         model_output: Any,
         *,
         replace_all: bool = False,
+        batch_index: int = 0,
+        class_count: Optional[int] = None,
     ) -> Dict[Tuple[int, int], torch.Tensor]:
         """Update the CPU span-score history with candidates from one session call."""
         logits = model_output.logits
@@ -3299,16 +3379,22 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
             logits = torch.as_tensor(logits)
         if logits.dim() == 4:
             logits = logits.flatten(1, 2)
-        if logits.dim() != 3 or logits.size(0) != 1:
-            raise ValueError("Session span logits must have shape (1, num_spans, num_classes)")
+        if logits.dim() != 3:
+            raise ValueError("Session span logits must have shape (batch, num_spans, num_classes)")
+        if not 0 <= batch_index < logits.size(0):
+            raise IndexError("batch_index is outside the model output batch")
 
-        span_idx = model_output.span_idx.view(1, -1, 2)
-        span_mask = model_output.span_mask.view(1, -1).bool()
+        span_idx = model_output.span_idx.view(logits.size(0), -1, 2)
+        span_mask = model_output.span_mask.view(logits.size(0), -1).bool()
         if span_idx.size(1) != logits.size(1) or span_mask.size(1) != logits.size(1):
             raise ValueError("Session span indices, mask, and logits must describe the same candidates")
 
-        valid_idx = span_idx[0, span_mask[0]].detach().cpu()
-        valid_logits = logits[0, span_mask[0]].detach().cpu()
+        row_mask = span_mask[batch_index]
+        valid_idx = span_idx[batch_index, row_mask].detach().cpu()
+        valid_logits = logits[batch_index, row_mask]
+        if class_count is not None:
+            valid_logits = valid_logits[..., :class_count]
+        valid_logits = valid_logits.detach().cpu()
         merged = {} if replace_all else previous.copy()
         for boundary, scores in zip(valid_idx.tolist(), valid_logits):
             merged[(int(boundary[0]), int(boundary[1]))] = scores.clone()
@@ -3324,25 +3410,32 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         tokens,
         char_starts,
         char_ends,
+        *,
+        batch_index=0,
+        past_key_values=None,
     ):
         current_attention = (
             batch["label_attention_mask"] if "label_attention_mask" in batch else batch["attention_mask"]
         )
-        valid_tokens = current_attention[0].bool()
-        input_ids = batch["input_ids"][0][valid_tokens]
-        token_word_mask = batch["words_mask"][0][valid_tokens]
+        valid_tokens = current_attention[batch_index].bool()
+        input_ids = batch["input_ids"][batch_index][valid_tokens]
+        token_word_mask = batch["words_mask"][batch_index][valid_tokens]
 
         raw_words, raw_word_mask = self._reserve_word_cache(
-            model_output.past_word_embeddings[0],
-            model_output.past_word_mask[0],
+            model_output.past_word_embeddings[batch_index],
+            model_output.past_word_mask[batch_index],
         )
         raw_prompts, prompt_mask = self._compact_row(
-            model_output.cached_prompts_embedding[0],
-            model_output.cached_prompts_mask[0],
+            model_output.cached_prompts_embedding[batch_index],
+            model_output.cached_prompts_mask[batch_index],
         )
         cached_length = input_ids.size(0)
         return CacheState(
-            past_key_values=model_output.past_key_values,
+            past_key_values=(
+                model_output.past_key_values
+                if past_key_values is None
+                else past_key_values
+            ),
             input_ids=input_ids.detach(),
             attention_mask=torch.ones_like(input_ids),
             token_word_mask=token_word_mask.detach(),
@@ -3358,7 +3451,13 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
             tokens=list(tokens),
             char_starts=list(char_starts),
             char_ends=list(char_ends),
-            span_logits=self._merge_session_span_logits({}, model_output, replace_all=True),
+            span_logits=self._merge_session_span_logits(
+                {},
+                model_output,
+                replace_all=True,
+                batch_index=batch_index,
+                class_count=len(labels),
+            ),
         )
 
     def _decode_session_output(
@@ -3410,17 +3509,8 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
             entities.append(entity)
         return entities
 
-    def _run_session_item(
-        self,
-        text,
-        labels,
-        session_id,
-        recompute,
-        threshold,
-        flat_ner,
-        multi_label,
-        return_class_probs,
-    ):
+    def _prepare_session_item(self, text, labels, session_id, recompute):
+        """Prepare semantic and token metadata for one streaming append."""
         state = self._session_cache.get(session_id)
         if state is not None and state.labels != tuple(labels) and not recompute:
             raise ValueError(
@@ -3432,16 +3522,641 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         current_starts = current_starts[0]
         current_ends = current_ends[0]
         char_offset = len(state.text) if state is not None else 0
-        combined_text = (state.text if state is not None else "") + text
-        combined_tokens = (state.tokens if state is not None else []) + current_tokens
-        combined_starts = (state.char_starts if state is not None else []) + [
-            char_offset + value for value in current_starts
-        ]
-        combined_ends = (state.char_ends if state is not None else []) + [
-            char_offset + value for value in current_ends
+        return {
+            "session_id": session_id,
+            "labels": tuple(labels),
+            "state": state,
+            "current_tokens": current_tokens,
+            "current_starts": current_starts,
+            "current_ends": current_ends,
+            "combined_text": (state.text if state is not None else "") + text,
+            "combined_tokens": (state.tokens if state is not None else []) + current_tokens,
+            "combined_starts": (state.char_starts if state is not None else [])
+            + [char_offset + value for value in current_starts],
+            "combined_ends": (state.char_ends if state is not None else [])
+            + [char_offset + value for value in current_ends],
+            "full_recompute": state is None or recompute,
+        }
+
+    def _run_full_session_batch(self, items):
+        """Run cold or explicitly recomputed sessions in one model forward."""
+        tokens_batch = [item["combined_tokens"] for item in items]
+        labels_batch = [list(item["labels"]) for item in items]
+        batch = self._collate_session_batch(
+            tokens_batch,
+            labels_batch,
+            include_prompt=True,
+        )
+        batch = {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
+        token_counts = batch["attention_mask"].sum(dim=1).tolist()
+        for item, token_count in zip(items, token_counts):
+            self._validate_context_length(int(token_count), item["session_id"])
+
+        model_output = self.model(
+            **batch,
+            past_key_values=self._create_session_cache(),
+        )
+        row_caches = split_past_key_values(
+            model_output.past_key_values,
+            [int(length) for length in token_counts],
+            config=self.model.token_rep_layer.decoder_layer.model.config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+        batch["label_attention_mask"] = batch["attention_mask"]
+
+        states = []
+        for row, (item, row_cache) in enumerate(zip(items, row_caches)):
+            states.append(
+                self._state_from_output(
+                    item["session_id"],
+                    item["labels"],
+                    batch,
+                    model_output,
+                    item["combined_text"],
+                    item["combined_tokens"],
+                    item["combined_starts"],
+                    item["combined_ends"],
+                    batch_index=row,
+                    past_key_values=row_cache,
+                )
+            )
+        for state in states:
+            self._session_cache.put(state)
+        return states
+
+    @staticmethod
+    def _stack_session_word_cache(states, capacity):
+        reference = states[0].past_word_embeddings
+        embeddings = reference.new_empty(
+            len(states),
+            capacity,
+            reference.size(-1),
+        )
+        mask = torch.zeros(
+            len(states),
+            capacity,
+            dtype=torch.bool,
+            device=reference.device,
+        )
+        for row, state in enumerate(states):
+            valid = state.past_word_mask.bool()
+            compact = state.past_word_embeddings[valid]
+            embeddings[row, : compact.size(0)].copy_(compact)
+            mask[row, : compact.size(0)] = True
+        return embeddings, mask
+
+    @staticmethod
+    def _stack_session_prompts(states):
+        max_prompts = max(state.prompts_embedding.size(0) for state in states)
+        reference = states[0].prompts_embedding
+        embeddings = reference.new_zeros(
+            len(states),
+            max_prompts,
+            reference.size(-1),
+        )
+        mask = torch.zeros(
+            len(states),
+            max_prompts,
+            dtype=torch.bool,
+            device=reference.device,
+        )
+        for row, state in enumerate(states):
+            valid = state.prompts_mask.bool()
+            compact = state.prompts_embedding[valid]
+            embeddings[row, : compact.size(0)].copy_(compact)
+            mask[row, : compact.size(0)] = True
+        return embeddings, mask
+
+    @staticmethod
+    def _reserve_batched_word_cache(values, mask):
+        capacity = max(DEFAULT_CACHE_INITIAL_CAPACITY, values.size(1))
+        if capacity == values.size(1):
+            return values.detach(), mask.bool().detach()
+        storage = values.new_empty(values.size(0), capacity, values.size(2))
+        storage_mask = torch.zeros(
+            values.size(0),
+            capacity,
+            dtype=torch.bool,
+            device=values.device,
+        )
+        storage[:, : values.size(1)].copy_(values)
+        storage_mask[:, : mask.size(1)] = mask.bool()
+        return storage.detach(), storage_mask.detach()
+
+    def _prepare_persistent_batch_items(
+        self,
+        state,
+        session_ids,
+        labels,
+        texts,
+    ):
+        items = []
+        for row, (session_id, text) in enumerate(zip(session_ids, texts)):
+            previous = None if state is None else state.sessions[row]
+            current_tokens, current_starts, current_ends = self.prepare_inputs([text])
+            current_tokens = current_tokens[0]
+            current_starts = current_starts[0]
+            current_ends = current_ends[0]
+            char_offset = len(previous.text) if previous is not None else 0
+            items.append(
+                {
+                    "session_id": session_id,
+                    "labels": tuple(labels),
+                    "previous": previous,
+                    "current_tokens": current_tokens,
+                    "combined_text": (previous.text if previous is not None else "") + text,
+                    "combined_tokens": (previous.tokens if previous is not None else []) + current_tokens,
+                    "combined_starts": (previous.char_starts if previous is not None else [])
+                    + [char_offset + value for value in current_starts],
+                    "combined_ends": (previous.char_ends if previous is not None else [])
+                    + [char_offset + value for value in current_ends],
+                }
+            )
+        return items
+
+    def _decode_persistent_batch_state(
+        self,
+        state,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+    ):
+        return [
+            self._decode_session_output(
+                session,
+                threshold,
+                flat_ner,
+                multi_label,
+                return_class_probs,
+            )
+            for session in state.sessions
         ]
 
-        full_recompute = state is None or recompute
+    @torch.inference_mode()
+    def _run_persistent_stream_batch(
+        self,
+        state,
+        session_ids,
+        labels,
+        texts,
+        *,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+        recompute,
+    ):
+        """Advance a fixed-order batch while retaining one batched KV cache."""
+        with self._stream_execution_lock:
+            if state is not None and state.batch_size != len(session_ids):
+                raise ValueError("Persistent streaming batch size cannot change")
+            if state is not None and tuple(session.session_id for session in state.sessions) != tuple(session_ids):
+                raise ValueError("Persistent streaming session order cannot change")
+
+            if state is not None and not recompute and not any(text.strip() for text in texts):
+                return state, self._decode_persistent_batch_state(
+                    state,
+                    threshold,
+                    flat_ner,
+                    multi_label,
+                    return_class_probs,
+                )
+            if state is None and not any(text.strip() for text in texts):
+                return None, [[] for _ in texts]
+
+            items = self._prepare_persistent_batch_items(
+                state,
+                session_ids,
+                labels,
+                texts,
+            )
+            full_recompute = state is None or recompute
+
+            if full_recompute:
+                batch = self._collate_session_batch(
+                    [item["combined_tokens"] for item in items],
+                    [list(item["labels"]) for item in items],
+                    include_prompt=True,
+                )
+                batch = {
+                    key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+                    for key, value in batch.items()
+                }
+                token_counts = batch["attention_mask"].sum(dim=1).long()
+                for item, token_count in zip(items, token_counts.tolist()):
+                    self._validate_context_length(int(token_count), item["session_id"])
+                model_output = self.model(
+                    **batch,
+                    past_key_values=self._create_session_cache(),
+                )
+                past_words, past_word_mask = self._reserve_batched_word_cache(
+                    model_output.past_word_embeddings,
+                    model_output.past_word_mask,
+                )
+                sessions = []
+                for row, (item, token_count) in enumerate(zip(items, token_counts.tolist())):
+                    sessions.append(
+                        CacheState(
+                            cached_length=int(token_count),
+                            next_position_id=int(token_count),
+                            session_id=item["session_id"],
+                            labels=item["labels"],
+                            text=item["combined_text"],
+                            tokens=item["combined_tokens"],
+                            char_starts=item["combined_starts"],
+                            char_ends=item["combined_ends"],
+                            span_logits=self._merge_session_span_logits(
+                                {},
+                                model_output,
+                                replace_all=True,
+                                batch_index=row,
+                                class_count=len(item["labels"]),
+                            ),
+                        )
+                    )
+                new_state = _PersistentBatchState(
+                    past_key_values=model_output.past_key_values,
+                    attention_mask=batch["attention_mask"].detach(),
+                    past_word_embeddings=past_words,
+                    past_word_mask=past_word_mask,
+                    prompts_embedding=model_output.cached_prompts_embedding.detach(),
+                    prompts_mask=model_output.cached_prompts_mask.bool().detach(),
+                    cached_lengths=token_counts.to(self.device),
+                    next_position_ids=token_counts.to(self.device),
+                    sessions=sessions,
+                )
+                return new_state, self._decode_persistent_batch_state(
+                    new_state,
+                    threshold,
+                    flat_ner,
+                    multi_label,
+                    return_class_probs,
+                )
+
+            span_candidates = []
+            for item in items:
+                previous = item["previous"]
+                if not item["current_tokens"]:
+                    span_candidates.append(
+                        (
+                            torch.zeros((0, 2), dtype=torch.long),
+                            torch.zeros(0, dtype=torch.bool),
+                        )
+                    )
+                    continue
+                right_context_width = getattr(self.config, "right_context_width", None)
+                if right_context_width is None:
+                    right_context_width = self.config.max_width
+                span_candidates.append(
+                    prepare_streaming_span_idx(
+                        previous.word_length,
+                        len(item["current_tokens"]),
+                        self.config.max_width,
+                        recompute_all=self.model.span_rep_layer.uses_bidirectional_context,
+                        right_context_width=right_context_width,
+                    )
+                )
+
+            batch = self._collate_session_batch(
+                [item["current_tokens"] for item in items],
+                [list(item["labels"]) for item in items],
+                include_prompt=False,
+                span_candidates=span_candidates,
+            )
+            batch = {
+                key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+                for key, value in batch.items()
+            }
+            current_attention = batch["attention_mask"]
+            current_counts = current_attention.sum(dim=1).long()
+            for item, previous, current_count in zip(items, state.sessions, current_counts.tolist()):
+                self._validate_context_length(
+                    previous.cached_length + int(current_count),
+                    item["session_id"],
+                )
+
+            physical_length = state.physical_length + batch["input_ids"].size(1)
+            context_limit = self._decoder_context_limit()
+            if context_limit is not None and physical_length > context_limit:
+                raise ValueError(
+                    f"Persistent streaming batch would contain {physical_length} physical cache positions, "
+                    f"exceeding the configured context limit of {context_limit}. Reset the batch before continuing."
+                )
+
+            full_attention = torch.cat([state.attention_mask, current_attention], dim=1)
+            position_ids = state.next_position_ids.unsqueeze(1) + torch.arange(
+                batch["input_ids"].size(1),
+                device=self.device,
+            ).unsqueeze(0)
+            past_word_lengths = torch.tensor(
+                [session.word_length for session in state.sessions],
+                dtype=torch.long,
+                device=self.device,
+            )
+            model_output = self.model(
+                input_ids=batch["input_ids"],
+                attention_mask=full_attention,
+                label_attention_mask=current_attention,
+                past_word_length=past_word_lengths,
+                past_key_values=state.past_key_values,
+                past_word_embeddings=state.past_word_embeddings,
+                past_word_mask=state.past_word_mask,
+                prompts_embedding=state.prompts_embedding,
+                prompts_embedding_mask=state.prompts_mask,
+                words_mask=batch["words_mask"],
+                text_lengths=batch["text_lengths"],
+                span_idx=batch["span_idx"],
+                span_mask=batch["span_mask"],
+                position_ids=position_ids,
+            )
+
+            sessions = []
+            for row, (item, previous, current_count) in enumerate(
+                zip(items, state.sessions, current_counts.tolist())
+            ):
+                sessions.append(
+                    CacheState(
+                        cached_length=previous.cached_length + int(current_count),
+                        next_position_id=previous.next_position + int(current_count),
+                        session_id=item["session_id"],
+                        labels=item["labels"],
+                        text=item["combined_text"],
+                        tokens=item["combined_tokens"],
+                        char_starts=item["combined_starts"],
+                        char_ends=item["combined_ends"],
+                        span_logits=self._merge_session_span_logits(
+                            previous.span_logits,
+                            model_output,
+                            batch_index=row,
+                            class_count=len(item["labels"]),
+                        ),
+                    )
+                )
+
+            new_state = _PersistentBatchState(
+                past_key_values=model_output.past_key_values,
+                attention_mask=full_attention.detach(),
+                past_word_embeddings=model_output.past_word_embeddings.detach(),
+                past_word_mask=model_output.past_word_mask.bool().detach(),
+                prompts_embedding=model_output.cached_prompts_embedding.detach(),
+                prompts_mask=model_output.cached_prompts_mask.bool().detach(),
+                cached_lengths=state.cached_lengths + current_counts,
+                next_position_ids=state.next_position_ids + current_counts,
+                sessions=sessions,
+            )
+            return new_state, self._decode_persistent_batch_state(
+                new_state,
+                threshold,
+                flat_ner,
+                multi_label,
+                return_class_probs,
+            )
+
+    def _run_incremental_session_batch(self, items):
+        """Run equal-cache-length warm sessions in one model forward."""
+        cached_states = [item["state"].to(self.device) for item in items]
+        cached_lengths = {state.cached_length for state in cached_states}
+        if len(cached_lengths) != 1:
+            raise ValueError("Incremental session batches require equal cached token lengths")
+        cached_length = cached_states[0].cached_length
+
+        span_candidates = []
+        for item, state in zip(items, cached_states):
+            right_context_width = getattr(self.config, "right_context_width", None)
+            if right_context_width is None:
+                right_context_width = self.config.max_width
+            span_candidates.append(
+                prepare_streaming_span_idx(
+                    state.word_length,
+                    len(item["current_tokens"]),
+                    self.config.max_width,
+                    recompute_all=self.model.span_rep_layer.uses_bidirectional_context,
+                    right_context_width=right_context_width,
+                )
+            )
+
+        batch = self._collate_session_batch(
+            [item["current_tokens"] for item in items],
+            [list(item["labels"]) for item in items],
+            include_prompt=False,
+            span_candidates=span_candidates,
+        )
+        batch = {
+            key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
+        current_attention = batch["attention_mask"]
+        current_token_counts = [int(value) for value in current_attention.sum(dim=1).tolist()]
+        for item, state, token_count in zip(items, cached_states, current_token_counts):
+            self._validate_context_length(
+                state.cached_length + token_count,
+                item["session_id"],
+            )
+
+        current_width = batch["input_ids"].size(1)
+        full_attention = torch.cat(
+            [torch.stack([state.attention_mask for state in cached_states]), current_attention],
+            dim=1,
+        )
+        position_starts = torch.tensor(
+            [state.next_position for state in cached_states],
+            dtype=torch.long,
+            device=self.device,
+        )
+        position_ids = position_starts.unsqueeze(1) + torch.arange(
+            current_width,
+            device=self.device,
+        ).unsqueeze(0)
+
+        past_word_lengths = torch.tensor(
+            [state.word_length for state in cached_states],
+            dtype=torch.long,
+            device=self.device,
+        )
+        required_word_capacity = max(
+            DEFAULT_CACHE_INITIAL_CAPACITY,
+            *(
+                state.word_length + len(item["current_tokens"])
+                for item, state in zip(items, cached_states)
+            ),
+        )
+        past_word_embeddings, past_word_mask = self._stack_session_word_cache(
+            cached_states,
+            required_word_capacity,
+        )
+        prompts_embedding, prompts_mask = self._stack_session_prompts(cached_states)
+        batched_cache = stack_past_key_values(
+            [state.past_key_values for state in cached_states],
+            config=self.model.token_rep_layer.decoder_layer.model.config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+
+        model_output = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=full_attention,
+            label_attention_mask=current_attention,
+            past_word_length=past_word_lengths,
+            past_key_values=batched_cache,
+            past_word_embeddings=past_word_embeddings,
+            past_word_mask=past_word_mask,
+            prompts_embedding=prompts_embedding,
+            prompts_embedding_mask=prompts_mask,
+            words_mask=batch["words_mask"],
+            text_lengths=batch["text_lengths"],
+            span_idx=batch["span_idx"],
+            span_mask=batch["span_mask"],
+            position_ids=position_ids,
+        )
+        total_token_lengths = [cached_length + count for count in current_token_counts]
+        row_caches = split_past_key_values(
+            model_output.past_key_values,
+            total_token_lengths,
+            config=self.model.token_rep_layer.decoder_layer.model.config,
+            max_cache_length=self._decoder_context_limit(),
+        )
+
+        states = []
+        for row, (item, cached, row_cache, current_token_count) in enumerate(
+            zip(items, cached_states, row_caches, current_token_counts)
+        ):
+            valid_current = current_attention[row].bool()
+            current_ids = batch["input_ids"][row][valid_current]
+            current_word_mask = batch["words_mask"][row][valid_current].clone()
+            current_word_mask[current_word_mask > 0] += cached.word_length
+            raw_words, raw_word_mask = self._reserve_word_cache(
+                model_output.past_word_embeddings[row],
+                model_output.past_word_mask[row],
+            )
+            raw_prompts, prompt_mask = self._compact_row(
+                model_output.cached_prompts_embedding[row],
+                model_output.cached_prompts_mask[row],
+            )
+            state = CacheState(
+                past_key_values=row_cache,
+                input_ids=torch.cat([cached.input_ids, current_ids]).detach(),
+                attention_mask=torch.ones(
+                    cached.cached_length + current_token_count,
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                token_word_mask=torch.cat(
+                    [cached.token_word_mask, current_word_mask]
+                ).detach(),
+                past_word_embeddings=raw_words.detach(),
+                past_word_mask=raw_word_mask.detach(),
+                prompts_embedding=raw_prompts.detach(),
+                prompts_mask=prompt_mask.detach(),
+                cached_length=cached.cached_length + current_token_count,
+                next_position_id=cached.next_position + current_token_count,
+                session_id=item["session_id"],
+                labels=item["labels"],
+                text=item["combined_text"],
+                tokens=item["combined_tokens"],
+                char_starts=item["combined_starts"],
+                char_ends=item["combined_ends"],
+                span_logits=self._merge_session_span_logits(
+                    item["state"].span_logits,
+                    model_output,
+                    batch_index=row,
+                    class_count=len(item["labels"]),
+                ),
+            )
+            states.append(state)
+        for state in states:
+            self._session_cache.put(state)
+        return states
+
+    @torch.inference_mode()
+    def _run_session_items_batched(self, requests, *, return_exceptions=False):
+        """Batch compatible session appends and return results in request order."""
+        with self._stream_execution_lock:
+            if not requests:
+                return []
+            session_ids = [request["session_id"] for request in requests]
+            if len(set(session_ids)) != len(session_ids):
+                raise ValueError("Duplicate session IDs in one streaming batch are ambiguous")
+
+            prepared = [None] * len(requests)
+            results = [None] * len(requests)
+            for index, request in enumerate(requests):
+                try:
+                    prepared[index] = self._prepare_session_item(
+                        request["text"],
+                        request["labels"],
+                        request["session_id"],
+                        request.get("recompute", False),
+                    )
+                except Exception as error:
+                    results[index] = error
+
+            groups = {}
+            for index, item in enumerate(prepared):
+                if item is None:
+                    continue
+                key = (
+                    "full",
+                    0,
+                ) if item["full_recompute"] else (
+                    "incremental",
+                    item["state"].cached_length,
+                )
+                groups.setdefault(key, []).append(index)
+
+            for (kind, _), indices in groups.items():
+                group_items = [prepared[index] for index in indices]
+                try:
+                    if kind == "full":
+                        group_states = self._run_full_session_batch(group_items)
+                    else:
+                        group_states = self._run_incremental_session_batch(group_items)
+                except Exception as error:
+                    for index in indices:
+                        results[index] = error
+                    continue
+
+                for index, state in zip(indices, group_states):
+                    request = requests[index]
+                    try:
+                        results[index] = self._decode_session_output(
+                            state,
+                            request.get("threshold", 0.5),
+                            request.get("flat_ner", True),
+                            request.get("multi_label", False),
+                            request.get("return_class_probs", False),
+                        )
+                    except Exception as error:
+                        results[index] = error
+
+            if not return_exceptions:
+                for result in results:
+                    if isinstance(result, Exception):
+                        raise result
+            return results
+
+    def _run_session_item(
+        self,
+        text,
+        labels,
+        session_id,
+        recompute,
+        threshold,
+        flat_ner,
+        multi_label,
+        return_class_probs,
+    ):
+        item = self._prepare_session_item(text, labels, session_id, recompute)
+        state = item["state"]
+        current_tokens = item["current_tokens"]
+        combined_text = item["combined_text"]
+        combined_tokens = item["combined_tokens"]
+        combined_starts = item["combined_starts"]
+        combined_ends = item["combined_ends"]
+
+        full_recompute = item["full_recompute"]
         if full_recompute:
             batch = self._collate_session_tokens(combined_tokens, labels, include_prompt=True)
             batch = {
@@ -3624,24 +4339,37 @@ class StreamingSpanGLiNER(BaseEncoderGLiNER):
         normalized_labels = list(dict.fromkeys(labels))
         if not normalized_labels:
             raise ValueError("At least one label is required")
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         self.eval()
-        outputs = []
-        for text, current_session in zip(texts, session_id):
+        outputs = [[] for _ in texts]
+        requests = []
+        request_indices = []
+        for index, (text, current_session) in enumerate(zip(texts, session_id)):
             if not isinstance(text, str) or not text.strip():
-                outputs.append([])
                 continue
-            outputs.append(
-                self._run_session_item(
-                    text,
-                    normalized_labels,
-                    current_session,
-                    recompute,
-                    threshold,
-                    flat_ner,
-                    multi_label,
-                    return_class_probs,
-                )
+            request_indices.append(index)
+            requests.append(
+                {
+                    "text": text,
+                    "labels": normalized_labels,
+                    "session_id": current_session,
+                    "recompute": recompute,
+                    "threshold": threshold,
+                    "flat_ner": flat_ner,
+                    "multi_label": multi_label,
+                    "return_class_probs": return_class_probs,
+                }
             )
+
+        for offset in range(0, len(requests), batch_size):
+            request_batch = requests[offset : offset + batch_size]
+            decoded_batch = self._run_session_items_batched(request_batch)
+            for index, decoded in zip(
+                request_indices[offset : offset + batch_size],
+                decoded_batch,
+            ):
+                outputs[index] = decoded
         return outputs
 
 

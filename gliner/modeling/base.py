@@ -650,14 +650,66 @@ class StreamingSpanModel(UniEncoderSpanModel):
         past_word_mask: torch.Tensor,
         current_word_embeddings: torch.Tensor,
         current_word_mask: torch.Tensor,
-        past_word_length: int,
+        past_word_length: Optional[Union[int, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Append words into reusable capacity-backed storage."""
-        current_word_length = current_word_embeddings.size(1)
-        required = past_word_length + current_word_length
+        """Append each row's valid words into reusable capacity-backed storage.
+
+        ``past_word_length`` may be a scalar for the legacy batch-size-one path
+        or a vector for cached streaming batches.  When omitted, valid cached
+        words are compacted according to ``past_word_mask`` before appending.
+        """
+        if past_word_embeddings.dim() != 3 or current_word_embeddings.dim() != 3:
+            raise ValueError("Word embeddings must have shape (batch, words, hidden)")
+        if past_word_mask.shape != past_word_embeddings.shape[:2]:
+            raise ValueError("past_word_mask must match past_word_embeddings")
+        if current_word_mask.shape != current_word_embeddings.shape[:2]:
+            raise ValueError("current_word_mask must match current_word_embeddings")
+        if past_word_embeddings.size(0) != current_word_embeddings.size(0):
+            raise ValueError("Cached and current word batches must have the same size")
+
+        batch_size = past_word_embeddings.size(0)
+        inferred_lengths = past_word_length is None
+        if inferred_lengths:
+            past_lengths = past_word_mask.long().sum(dim=1)
+        elif isinstance(past_word_length, torch.Tensor):
+            past_lengths = past_word_length.to(device=past_word_mask.device, dtype=torch.long).reshape(-1)
+        else:
+            past_lengths = torch.full(
+                (batch_size,),
+                int(past_word_length),
+                dtype=torch.long,
+                device=past_word_mask.device,
+            )
+        if past_lengths.numel() == 1 and batch_size != 1:
+            past_lengths = past_lengths.expand(batch_size)
+        if past_lengths.numel() != batch_size:
+            raise ValueError("past_word_length must contain one value per batch row")
+
+        current_lengths = current_word_mask.long().sum(dim=1)
+        required_lengths = past_lengths + current_lengths
+        required = int(required_lengths.max().item()) if batch_size else 0
         capacity = past_word_embeddings.size(1)
 
-        if required > capacity:
+        if inferred_lengths:
+            # Backward-compatible direct model calls return a compact tensor
+            # sized for the padded current word width. Capacity reservation is
+            # enabled only when callers supply authoritative cached lengths.
+            new_capacity = max(
+                required,
+                int(past_lengths.max().item()) + current_word_embeddings.size(1),
+            )
+            merged_embeddings = past_word_embeddings.new_empty(
+                past_word_embeddings.size(0),
+                new_capacity,
+                past_word_embeddings.size(2),
+            )
+            merged_mask = torch.zeros(
+                past_word_mask.size(0),
+                new_capacity,
+                dtype=torch.bool,
+                device=past_word_mask.device,
+            )
+        elif required > capacity:
             new_capacity = max(required, max(1, capacity) * 2)
             merged_embeddings = past_word_embeddings.new_empty(
                 past_word_embeddings.size(0),
@@ -670,17 +722,37 @@ class StreamingSpanModel(UniEncoderSpanModel):
                 dtype=torch.bool,
                 device=past_word_mask.device,
             )
-            if past_word_length:
-                active = slice(0, past_word_length)
-                merged_embeddings[:, active].copy_(past_word_embeddings[:, active])
-                merged_mask[:, active] = past_word_mask[:, active]
+            if capacity:
+                merged_embeddings[:, :capacity].copy_(past_word_embeddings)
+                merged_mask[:, :capacity] = past_word_mask.bool()
         else:
             merged_embeddings = past_word_embeddings
             merged_mask = past_word_mask
 
-        destination = slice(past_word_length, required)
-        merged_embeddings[:, destination].copy_(current_word_embeddings)
-        merged_mask[:, destination] = current_word_mask.bool()
+        # Older callers may supply a padded cache without authoritative lengths.
+        # Compact it once; explicit-length streaming paths preserve the prefix
+        # invariant and avoid copying historical words on every append.
+        if inferred_lengths:
+            past_valid = past_word_mask.bool()
+            past_rank = past_valid.long().cumsum(dim=1) - 1
+            past_rows = torch.arange(batch_size, device=past_word_mask.device).unsqueeze(1).expand_as(past_valid)
+            valid_values = past_word_embeddings[past_valid].clone()
+            valid_rows = past_rows[past_valid]
+            valid_columns = past_rank[past_valid]
+            merged_mask.zero_()
+            if valid_values.numel():
+                merged_embeddings[valid_rows, valid_columns] = valid_values
+                merged_mask[valid_rows, valid_columns] = True
+
+        current_valid = current_word_mask.bool()
+        current_rank = current_valid.long().cumsum(dim=1) - 1
+        destinations = past_lengths.unsqueeze(1) + current_rank
+        current_rows = torch.arange(batch_size, device=current_word_mask.device).unsqueeze(1).expand_as(current_valid)
+        if current_valid.any():
+            valid_rows = current_rows[current_valid]
+            valid_columns = destinations[current_valid]
+            merged_embeddings[valid_rows, valid_columns] = current_word_embeddings[current_valid]
+            merged_mask[valid_rows, valid_columns] = True
         return merged_embeddings, merged_mask
 
     def get_representations(
@@ -786,7 +858,18 @@ class StreamingSpanModel(UniEncoderSpanModel):
             if past_word_mask is None:
                 raise ValueError("past_word_mask is required with past_word_embeddings")
             if past_word_length is None:
-                past_word_length = int(past_word_mask.long().sum(dim=1).max().item())
+                past_lengths = past_word_mask.long().sum(dim=1)
+            elif isinstance(past_word_length, torch.Tensor):
+                past_lengths = past_word_length.to(device=current_word_mask.device, dtype=torch.long).reshape(-1)
+                if past_lengths.numel() == 1 and batch_size != 1:
+                    past_lengths = past_lengths.expand(batch_size)
+            else:
+                past_lengths = torch.full(
+                    (batch_size,),
+                    int(past_word_length),
+                    dtype=torch.long,
+                    device=current_word_mask.device,
+                )
             cached_words_embedding, cached_word_mask = self._merge_cached_words(
                 past_word_embeddings,
                 past_word_mask,
@@ -794,7 +877,8 @@ class StreamingSpanModel(UniEncoderSpanModel):
                 current_word_mask,
                 past_word_length,
             )
-            active_word_length = past_word_length + current_words_embedding.size(1)
+            active_word_lengths = past_lengths + current_word_mask.long().sum(dim=1)
+            active_word_length = int(active_word_lengths.max().item())
         else:
             cached_words_embedding = current_words_embedding
             cached_word_mask = current_word_mask

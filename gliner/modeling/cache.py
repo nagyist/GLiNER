@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from threading import RLock
 from dataclasses import field, replace, dataclass
 
@@ -401,3 +401,148 @@ def _move_past_kv(past_kv, device):
     if hasattr(past_kv, "to"):
         return past_kv.to(device)
     return past_kv
+
+
+def _cache_from_layers(
+    layer_values,
+    *,
+    config=None,
+    max_cache_length: int | None = None,
+) -> ReusableDynamicCache:
+    """Build a reusable cache from complete per-layer key/value tensors."""
+    cache = create_reusable_cache(config, max_cache_length=max_cache_length)
+    for layer_idx, keys, values in layer_values:
+        cache.update(keys, values, layer_idx)
+    return cache
+
+
+def copy_past_key_values(
+    past_kv,
+    *,
+    config=None,
+    max_cache_length: int | None = None,
+):
+    """Return an independent copy of a transformers-style KV cache.
+
+    Streaming cache layers append in place.  Tests, transactional helpers, and
+    dynamic batching therefore need an explicit copy operation rather than a
+    shallow ``copy.copy`` of the cache container.
+    """
+    if past_kv is None:
+        return None
+    if torch.is_tensor(past_kv):
+        return past_kv.detach().clone()
+    if isinstance(past_kv, (tuple, list)):
+        return type(past_kv)(
+            copy_past_key_values(
+                item,
+                config=config,
+                max_cache_length=max_cache_length,
+            )
+            for item in past_kv
+        )
+
+    cache_layers = list(_cache_layers(past_kv))
+    if cache_layers or _is_dynamic_cache_like(past_kv):
+        return _cache_from_layers(
+            (
+                (
+                    layer_idx,
+                    keys.detach().clone(),
+                    values.detach().clone(),
+                )
+                for layer_idx, keys, values in cache_layers
+            ),
+            config=config,
+            max_cache_length=max_cache_length,
+        )
+    raise TypeError(f"Unsupported past_key_values type: {type(past_kv).__name__}")
+
+
+def stack_past_key_values(
+    caches: Sequence[Any],
+    *,
+    config=None,
+    max_cache_length: int | None = None,
+) -> ReusableDynamicCache:
+    """Stack equal-length, batch-size-one caches along their batch dimension."""
+    if not caches:
+        raise ValueError("At least one cache is required")
+
+    cache_layers = [list(_cache_layers(cache)) for cache in caches]
+    if any(not layers for layers in cache_layers):
+        raise TypeError("Every cache must expose initialized key/value layers")
+
+    layer_indices = [tuple(layer_idx for layer_idx, _, _ in layers) for layers in cache_layers]
+    if any(indices != layer_indices[0] for indices in layer_indices[1:]):
+        raise ValueError("Caches must contain the same initialized layers")
+
+    stacked_layers = []
+    for layer_offset, layer_idx in enumerate(layer_indices[0]):
+        keys = [layers[layer_offset][1] for layers in cache_layers]
+        values = [layers[layer_offset][2] for layers in cache_layers]
+        reference_key_shape = keys[0].shape[1:]
+        reference_value_shape = values[0].shape[1:]
+        if any(key.size(0) != 1 or key.shape[1:] != reference_key_shape for key in keys):
+            raise ValueError("Only compatible batch-size-one caches can be stacked")
+        if any(value.size(0) != 1 or value.shape[1:] != reference_value_shape for value in values):
+            raise ValueError("Only compatible batch-size-one caches can be stacked")
+        stacked_layers.append(
+            (
+                layer_idx,
+                torch.cat(keys, dim=0),
+                torch.cat(values, dim=0),
+            )
+        )
+
+    return _cache_from_layers(
+        stacked_layers,
+        config=config,
+        max_cache_length=max_cache_length,
+    )
+
+
+def split_past_key_values(
+    past_kv,
+    lengths: Sequence[int],
+    *,
+    config=None,
+    max_cache_length: int | None = None,
+) -> list[ReusableDynamicCache]:
+    """Split a batched cache into compact batch-size-one session caches."""
+    normalized_lengths = [int(length) for length in lengths]
+    if not normalized_lengths:
+        return []
+    if any(length < 0 for length in normalized_lengths):
+        raise ValueError("Cache lengths must be non-negative")
+
+    layers = list(_cache_layers(past_kv))
+    if not layers:
+        raise TypeError("past_key_values must expose initialized key/value layers")
+    batch_size = layers[0][1].size(0)
+    if len(normalized_lengths) != batch_size:
+        raise ValueError("One cache length is required per batch row")
+
+    results = []
+    for row, length in enumerate(normalized_lengths):
+        row_layers = []
+        for layer_idx, keys, values in layers:
+            if keys.size(0) != batch_size or values.size(0) != batch_size:
+                raise ValueError("All cache layers must have the same batch size")
+            if length > keys.size(-2) or length > values.size(-2):
+                raise ValueError("Requested cache length exceeds the available cache")
+            row_layers.append(
+                (
+                    layer_idx,
+                    keys[row : row + 1, ..., :length, :].detach().clone(),
+                    values[row : row + 1, ..., :length, :].detach().clone(),
+                )
+            )
+        results.append(
+            _cache_from_layers(
+                row_layers,
+                config=config,
+                max_cache_length=max_cache_length,
+            )
+        )
+    return results
