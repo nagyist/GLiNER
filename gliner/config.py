@@ -126,7 +126,8 @@ class BaseGLiNERConfig(PretrainedConfig):
     is_composition = True
     model_type = None
 
-    def __init__(
+    # Keep positional compatibility for downstream callers of this public config API.
+    def __init__(  # noqa: PLR0917, RUF100
         self,
         model_name: str = "microsoft/deberta-v3-small",
         name: str = "gliner",
