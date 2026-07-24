@@ -1073,6 +1073,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                     f"which can degrade quality. Consider setting class_token_index: -1 and "
                     f"vocab_size: -1 so GLiNER adds all special tokens automatically.",
                     UserWarning,
+                    stacklevel=2,
                 )
 
         if ent_token is not None:
@@ -1083,6 +1084,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                     f"tokenizer id of {ent_token!r} ({ent_token_id}). The class-token mask will "
                     f"match a different token, which can silently disable learning.",
                     UserWarning,
+                    stacklevel=2,
                 )
 
         if config_instance.vocab_size != tokenizer_size:
@@ -1090,6 +1092,7 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
                 f"config.vocab_size={config_instance.vocab_size} differs from the tokenizer size "
                 f"({tokenizer_size}). Embedding lookups may be misaligned or fail at runtime.",
                 UserWarning,
+                stacklevel=2,
             )
 
     @staticmethod
@@ -1236,7 +1239,8 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
         return instance
 
     @classmethod
-    def from_pretrained(
+    # Keep positional compatibility for downstream callers of this public loading API.
+    def from_pretrained(  # noqa: PLR0917, RUF100
         cls,
         model_id: str,
         model_dir: Optional[str] = None,
@@ -1840,7 +1844,8 @@ class BaseGLiNER(ABC, nn.Module, PyTorchModelHubMixin):
             warnings.warn(f"Component '{component_name}' not found. Available components: {available}", stacklevel=2)
 
     @classmethod
-    def create_training_args(
+    # Keep positional compatibility for downstream callers of this public training API.
+    def create_training_args(  # noqa: PLR0917, RUF100
         cls,
         output_dir: Union[str, Path],
         learning_rate: float = 5e-5,
@@ -6113,7 +6118,8 @@ class GLiNER(nn.Module, PyTorchModelHubMixin):
         return GLiNERConfig(**config_dict)
 
     @classmethod
-    def from_pretrained(
+    # Keep positional compatibility for downstream callers of this public loading API.
+    def from_pretrained(  # noqa: PLR0917, RUF100
         cls,
         model_id: str,
         revision: Optional[str] = None,
