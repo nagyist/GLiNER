@@ -17,7 +17,7 @@ Subpackages
    gliner.evaluation
    gliner.modeling
    gliner.multitask
-   gliner.onnx
+   gliner.runtime
    gliner.serve
    gliner.training
 
@@ -30,4 +30,5 @@ Submodules
    gliner.config
    gliner.infer_packing
    gliner.model
+   gliner.streaming
    gliner.utils

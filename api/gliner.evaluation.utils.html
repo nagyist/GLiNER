@@ -2,7 +2,7 @@
 <html lang="en" data-accent-color="violet" data-content_root="../">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>gliner.evaluation.utils module - Home 0.2.24 documentation</title><link rel="index" title="Index" href="../genindex.html" /><link rel="search" title="Search" href="../search.html" /><link rel="next" title="gliner.onnx package" href="gliner.onnx.html" /><link rel="prev" title="gliner.evaluation.evaluator module" href="gliner.evaluation.evaluator.html" /><script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>gliner.evaluation.utils module - Home 0.2.24 documentation</title><link rel="index" title="Index" href="../genindex.html" /><link rel="search" title="Search" href="../search.html" /><link rel="next" title="gliner.runtime package" href="gliner.runtime.html" /><link rel="prev" title="gliner.evaluation.evaluator module" href="gliner.evaluation.evaluator.html" /><script>
     function setColorMode(t){let e=document.documentElement;e.setAttribute("data-color-mode",t);let a=window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches,s=t;"auto"===t&&(s=a?"dark":"light"),"light"===s?(e.classList.remove("dark"),e.classList.add("light")):(e.classList.remove("light"),e.classList.add("dark"))}
     setColorMode(localStorage._theme||"auto");
   </script><link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=e1a1ceaf" />
@@ -63,12 +63,14 @@ data-aria-dark="Switch to auto color mode">
 <li class="toctree-l1"><a class="reference internal" href="../configs.html">Components &amp; Configs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../training.html">Training</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../architectures.html">Architectures</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../convert_to_onnx.html">ONNX Export &amp; Deployment</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../add_custom_architecture.html">Creating Custom GLiNER Architectures</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../convert_to_onnx.html">Runtime export and inference</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../serving.html">Serving</a></li>
 </ul>
 <p class="caption" role="heading" aria-level="3"><span class="caption-text">API Reference</span></p>
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="gliner.model.html">gliner.model module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gliner.streaming.html">gliner.streaming module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gliner.config.html">gliner.config module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gliner.training.html">gliner.training package</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="gliner.training.trainer.html">gliner.training.trainer module</a></li>
@@ -81,6 +83,8 @@ data-aria-dark="Switch to auto color mode">
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="gliner.modeling.base.html">gliner.modeling.base module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gliner.modeling.cache.html">gliner.modeling.cache module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gliner.modeling.context_encoders.html">gliner.modeling.context_encoders module</a></li>
 <li class="toctree-l2"><a class="reference internal" href="gliner.modeling.decoder.html">gliner.modeling.decoder module</a></li>
 <li class="toctree-l2"><a class="reference internal" href="gliner.modeling.encoder.html">gliner.modeling.encoder module</a></li>
 <li class="toctree-l2"><a class="reference internal" href="gliner.modeling.layers.html">gliner.modeling.layers module</a></li>
@@ -104,8 +108,10 @@ data-aria-dark="Switch to auto color mode">
 <li class="toctree-l2 current"><a class="current reference internal" href="#">gliner.evaluation.utils module</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="gliner.onnx.html">gliner.onnx package</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="gliner.onnx.model.html">gliner.onnx.model module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gliner.runtime.html">gliner.runtime package</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="gliner.runtime.base.html">gliner.runtime.base module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gliner.runtime.onnx.html">gliner.runtime.onnx module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gliner.runtime.openvino.html">gliner.runtime.openvino module</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="gliner.decoding.html">gliner.decoding package</a><ul>
@@ -130,12 +136,7 @@ data-aria-dark="Switch to auto color mode">
     <button class="rside-close js-menu xl:hidden" aria-label="Close Table of Contents" type="button" aria-controls="rside" aria-expanded="false">
       <i class="i-lucide close"></i>
     </button>
-    <div class="sy-scrollbar sy-rside-inner px-6 xl:top-16 xl:sticky xl:pl-0 pt-6 pb-4"><div class="localtoc"><h3>On this page</h3><ul>
-<li><a class="reference internal" href="#gliner.evaluation.utils.UndefinedMetricWarning"><code class="docutils literal notranslate"><span class="pre">UndefinedMetricWarning</span></code></a></li>
-<li><a class="reference internal" href="#gliner.evaluation.utils.extract_tp_actual_correct"><code class="docutils literal notranslate"><span class="pre">extract_tp_actual_correct()</span></code></a></li>
-<li><a class="reference internal" href="#gliner.evaluation.utils.flatten_for_eval"><code class="docutils literal notranslate"><span class="pre">flatten_for_eval()</span></code></a></li>
-</ul>
-</div><div id="ethical-ad-placement" data-ea-publisher="readthedocs"></div></div>
+    <div class="sy-scrollbar sy-rside-inner px-6 xl:top-16 xl:sticky xl:pl-0 pt-6 pb-4"><div id="ethical-ad-placement" data-ea-publisher="readthedocs"></div></div>
   </aside>
   <div class="rside-overlay js-menu" role="button" aria-label="Close Table of Contents" aria-controls="rside" aria-expanded="false"></div>
   <main class="sy-main w-full max-sm:max-w-full print:pt-6">
@@ -168,24 +169,8 @@ data-aria-dark="Switch to auto color mode">
 </div><div class="flex flex-col break-words justify-between">
       <div class="min-w-0 max-w-6xl px-6 pb-6 pt-8 xl:px-12">
         <article class="yue" role="main">
-          <section id="module-gliner.evaluation.utils">
-<span id="gliner-evaluation-utils-module"></span><h1>gliner.evaluation.utils module<a class="headerlink" href="#module-gliner.evaluation.utils" title="Link to this heading">¶</a></h1>
-<dl class="py exception">
-<dt class="sig sig-object py" id="gliner.evaluation.utils.UndefinedMetricWarning">
-<em class="property"><span class="pre">exception</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">gliner.evaluation.utils.</span></span><span class="sig-name descname"><span class="pre">UndefinedMetricWarning</span></span><a class="reference internal" href="../_modules/gliner/evaluation/utils.html#UndefinedMetricWarning"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#gliner.evaluation.utils.UndefinedMetricWarning" title="Link to this definition">¶</a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">UserWarning</span></code></p>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="gliner.evaluation.utils.extract_tp_actual_correct">
-<span class="sig-prename descclassname"><span class="pre">gliner.evaluation.utils.</span></span><span class="sig-name descname"><span class="pre">extract_tp_actual_correct</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">y_true</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y_pred</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/gliner/evaluation/utils.html#extract_tp_actual_correct"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#gliner.evaluation.utils.extract_tp_actual_correct" title="Link to this definition">¶</a></dt>
-<dd></dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="gliner.evaluation.utils.flatten_for_eval">
-<span class="sig-prename descclassname"><span class="pre">gliner.evaluation.utils.</span></span><span class="sig-name descname"><span class="pre">flatten_for_eval</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">y_true</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">y_pred</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/gliner/evaluation/utils.html#flatten_for_eval"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#gliner.evaluation.utils.flatten_for_eval" title="Link to this definition">¶</a></dt>
-<dd></dd></dl>
-
+          <section id="gliner-evaluation-utils-module">
+<h1>gliner.evaluation.utils module<a class="headerlink" href="#gliner-evaluation-utils-module" title="Link to this heading">¶</a></h1>
 </section>
 
         </article><button class="back-to-top" type="button">
@@ -200,10 +185,10 @@ data-aria-dark="Switch to auto color mode">
         <span>Previous</span><div class="title">gliner.evaluation.evaluator module</div></div>
     </a>
   </div><div class="navigation-next">
-    <a href="gliner.onnx.html">
+    <a href="gliner.runtime.html">
       <div class="page-info">
         <span>Next</span>
-        <div class="title">gliner.onnx package</div>
+        <div class="title">gliner.runtime package</div>
       </div>
       <i class="i-lucide chevron-right"></i>
     </a>
